@@ -10,7 +10,6 @@ import json
 import codecs
 import subprocess
 import argparse
-import select
 import platform
 import struct
 import functools
@@ -20,7 +19,6 @@ DEFAULT_ARRAY_MAX = 5
 DEFAULT_STRING_MAX = 64
 
 verbose = False
-# verbose = True
 log_nest_level = 0
 
 
@@ -52,12 +50,6 @@ def log_exception():
 
 
 def pretty(value, htchar='\t', lfchar='\n', max_depth=0, indent=0):
-    # v = str(value)
-    # if len(v) > 50:
-    #     v = v[:50]
-    # print("indent %d, value: %s" % (indent, v))
-    # if max_depth and indent >= max_depth:
-    #     return '...'
     nlch = lfchar + htchar * (indent + 1)
     if isinstance(value, dict):
         if max_depth and indent >= max_depth:
@@ -370,8 +362,6 @@ class BTF(object):
         if type_info.get('kind', None) == self.BTF_KIND_PTR:
             return type_info
 
-        # type = type_info.get('type', None)
-        # if type is not None and :
         if 'type' in type_info and 'type_obj' not in type_info:
             type = type_info.pop('type')
             type_info['type_obj'] = \
@@ -381,11 +371,6 @@ class BTF(object):
         members = type_info.get('members', [])
         for m in members:
             self.assemble_type(m)
-        # if members is not None:
-        #     members_objs = []
-        #     for m in members: 
-        #         members_objs.append(self.assemble_type(m))
-        #     type_info['members'] = members_objs
 
         return type_info
 
@@ -395,8 +380,6 @@ class BTF(object):
         return self.assemble_type(type_info)
 
     def dereference_type(self, type_info):
-        # if type_info['kind'] != self.BTF_KIND_PTR:
-        #     raise Exception("type of '%s' is not pointer", type_info)
         if 'type_obj' not in type_info:
             ref_type_id = type_info['type']
             ref_type_info = self.decoded_types[ref_type_id]
@@ -427,10 +410,37 @@ class BTF(object):
         else:
             return 0
 
+    def get_type_str(self, type_info):
+        self.assemble_type(type_info)
+
+        if type_info['kind'] == self.BTF_KIND_PTR:
+            return "%s *" % self.get_type_str(self.decoded_types[type_info['type']])
+        elif type_info['kind'] == self.BTF_KIND_STRUCT:
+            return "struct %s" % type_info['name']
+        elif type_info['kind'] == self.BTF_KIND_UNION:
+            return "union %s" % type_info['name']
+        elif type_info['kind'] == self.BTF_KIND_ENUM:
+            return "enum %s" % type_info['name']
+        elif type_info['kind'] == self.BTF_KIND_VOLATILE:
+            return "volatile %s" % self.get_type_str(type_info['type_obj'])
+        elif type_info['kind'] == self.BTF_KIND_CONST:
+            return "const %s" % self.get_type_str(type_info['type_obj'])
+        elif type_info['kind'] == self.BTF_KIND_RESTRICT:
+            return "restrict %s" % self.get_type_str(type_info['type_obj'])
+        elif type_info['kind'] == self.BTF_KIND_FUNC_PROTO:
+            return "void *"
+        elif type_info['kind'] == self.BTF_KIND_ARRAY:
+            # TODO priority
+            return "%s[%d]" % (self.get_type_str(type_info['type_obj']), type_info['nelems'])
+        elif 'name' in type_info:
+            return type_info['name']
+        else:
+            raise Exception("unsupported type: %s" % type_info)
+
 def get_symbol_addr(name):
     output = subprocess.check_output(
         "cat /proc/kallsyms | grep -w %s | awk '{print $1}'" % name,
-        shell=True)
+        shell=True).decode()
     return int('0x' + output, base=0)
 
 class KernelMem(object):
@@ -440,7 +450,7 @@ class KernelMem(object):
 
         output = subprocess.check_output(
             "objdump -h /proc/kcore  | grep load | awk '{print $3,$4,$6}'",
-            shell=True)
+            shell=True).decode()
 
         if verbose:
             print("memory segments: ", file=sys.stderr)
@@ -818,210 +828,59 @@ class Parser(object):
             raise self.lexer.error_with_last_pos(
                 "expect symbol, number or expression, but get '%s'" % token)
 
-
-# def read_timeout(fp, timeout, size=1024*1024):
-#     r, _, _ = select.select([fp], [], [], timeout)
-#     if fp not in r:
-#         return b''
-
-#     return os.read(fp.fileno(), size)
-
-
-# class GdbShell(object):
-#     PROMPT = '(gdb)'
-
-#     def __init__(self, elf_path):
-#         self.gdb = subprocess.Popen('gdb ' + elf_path, shell=True,
-#                                     stdin=subprocess.PIPE,
-#                                     stdout=subprocess.PIPE,
-#                                     stderr=subprocess.PIPE, bufsize=1)
-
-#         output, err = self._read_output(timeout=5)
-#         if self.PROMPT not in output:
-#             raise Exception('gdb init failed, path: %s\n'
-#                             '----- stdout -----\n%s\n'
-#                             '----- stderr -----\n%s' %
-#                             (elf_path, output, err))
-#         self.run_cmd('print "hello"')
-
-#     def __del__(self):
-#         gdb = getattr(self, 'gdb', None)
-#         if not gdb:
-#             return
-
-#         gdb.kill()
-#         gdb.wait()
-
-#     def _read_output(self, timeout=1):
-#         output = read_timeout(self.gdb.stdout, timeout).decode()
-#         output_all = ''
-#         while output:
-#             output_all += output
-#             if self.PROMPT in output:
-#                 break
-#             output = read_timeout(self.gdb.stdout, timeout).decode()
-
-#         err_str = read_timeout(self.gdb.stderr, 0).decode()
-
-#         return output_all, err_str
-
-#     @cache_result
-#     @log_arg_ret
-#     def run_cmd(self, cmd):
-#         self.gdb.stdin.write((cmd + '\n').encode())
-#         self.gdb.stdin.flush()
-#         output, err = self._read_output()
-#         lines = output.splitlines()
-#         if self.PROMPT not in output or err or len(lines) <= 1:
-#             raise Exception('run gdb command "%s" failed\n'
-#                             '----- stdout -----\n%s\n'
-#                             '----- stderr -----\n%s' %
-#                             (cmd, output, err))
-
-#         return '\n'.join(lines[:-1])
-
-
 class Dumper(object):
     BLANK = '    '
 
-    def __init__(self, # pid,
+    def __init__(self,
                  array_max=DEFAULT_ARRAY_MAX, string_max=DEFAULT_STRING_MAX,
                  array_max_force=False, string_max_force=False,
-                 hex_string=False, elf_path=None):
-        # exe = os.readlink(
-        #         os.path.join('/proc', str(pid), 'exe'))
+                 hex_string=False, btf_path='/sys/kernel/btf/vmlinux'):
+
         self.array_max = array_max
         self.string_max = string_max
         self.array_max_force = array_max_force
         self.string_max_force = string_max_force
         self.hex_string = hex_string
-        # self.elf_path = exe
-        # if elf_path:
-        #     self.elf_path = elf_path
-        # if not os.access(self.elf_path, os.R_OK):
-        #     raise Exception("can't read '%s', "
-        #                     "you can pass '-e ELF_PATH' to solve it" %
-        #                     self.elf_path)
-
-        # mem_path = os.path.join('/proc', str(pid), 'mem')
-        # self.mem_fp = open(mem_path, 'rb')
-        # maps = open(os.path.join('/proc', str(pid), 'maps')).read()
-        # self.base_addr = int([line for line in maps.splitlines()
-        #                       if exe in line][0].split('-')[0], base=16)
-        # # for non-PIE executable, see: https://stackoverflow.com/a/73189318/18251455
-        # if self.base_addr == 0x400000:
-        #     self.base_addr = 0
-
-        # self.gdb_shell = GdbShell(self.elf_path)
         self.kernel_mem = KernelMem()
-        self.btf = BTF('/home/u/sysak/source/tools/combine/btf/vmlinux-btf/vmlinux-5.19.0-1.1.an23.x86_64')
+        self.btf = BTF(btf_path)
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
-    # @log_arg_ret
-    # def simplify_type(self, type_info):
-    #     simplified_str = type_info.strip()
-    #     if simplified_str[0] == '(':
-    #         if simplified_str[-1] != ')':
-    #             raise Exception("parentheses not enclosed: '%s'" % type_info)
-    #         simplified_str = simplified_str[1:-1]
-
-    #     match = re.match(r'^\s*(static\s|const\s)+', simplified_str)
-    #     if match:
-    #         group1, = match.groups()
-    #         if group1:
-    #             simplified_str = simplified_str.replace(group1, '')
-
-    #     return simplified_str
-
-    # @cache_result
     @log_arg_ret
     def get_member_offset_and_type(self, type_info, member):
-        # output = self.gdb_shell.run_cmd('ptype ' + type_info)
-        # # example: '   struct _43rdewd ** _4rmem[43][5]'
-        # pattern = r'^\s*((\w+\s)?\w+(\s*\*+)?)\s*' + member + r'((\[\d+\])*);'
-        # match = re.match(pattern, output)
-        # if not match or not match.group(1):
-        #     raise Exception("type '%s' has no member '%s', ptype: %s" %
-        #                     (type_info, member, output))
-        # member_type = match.group(1) + (match.group(4) if match.group(4) else '')
         # TODO delete
+        # import pdb
+        # pdb.set_trace()
         try:
             for m in type_info['members']:
-                if m['name'] == member:
+                if m['name'] == str(member):
                     # TODO bitfield
-                    return m['offset']/8, m['type_obj']
-            # output = self.gdb_shell.run_cmd('p &((%s *)0)->%s' %
-            #                                 (type_info, member))
-            # pos1 = output.index('=')
-            # pos2 = output.index('0x')
-            # member_type = self.simplify_type(output[pos1 + 1:pos2])
-            # offset_str = output[pos2:].strip().split()[0]
-            # member_offset = int(offset_str, 0)
-            # return member_offset, self.dereference_type(member_type)[0]
+                    return int(m['offset']/8), m['type_obj']
         except Exception as e:
             append_err_txt(e, "failed to get offset(%s, %s): " %
                            (type_info, member))
             reraise()
 
-    # @cache_result
+        raise Exception("type '%s' has no member '%s'" % (type_info['name'], member))
+
     @log_arg_ret
     def get_symbol_address_and_type(self, symbol_str):
         try:
             return get_symbol_addr(symbol_str), None
-            # output = self.gdb_shell.run_cmd('p &%s' % symbol_str)
-            # pos1 = output.index('=')
-            # pos2 = output.index('0x')
-            # symbol_type = self.simplify_type(output[pos1 + 1:pos2])
-            # symbol_offset = int(output[pos2:].strip().split()[0], 0)
-            # return symbol_offset + self.base_addr, \
-            #     self.dereference_type(symbol_type)[0]
         except Exception as e:
             append_err_txt(e, "failed to get address of symbol '%s': " %
                            symbol_str)
             reraise()
 
-    # @cache_result
-    # @log_arg_ret
-    # def get_type_size(self, type_info):
-    #     try:
-    #         output = self.gdb_shell.run_cmd('p sizeof(%s)' % type_info)
-    #         pos = output.index('=')
-    #         return int(output[pos + 1:].strip().split()[0], 0)
-    #     except Exception as e:
-    #         append_err_txt(e, "failed to get size of '%s': " % type_info)
-    #         reraise()
-
     @log_arg_ret
     def dereference_addr(self, address):
-        # self.mem_fp.seek(address)
         try:
             data = self.kernel_mem.read(address, self.arch_size)
-            # data = self.mem_fp.read(self.arch_size)
         except Exception:
             raise Exception("read at address 0x%x failed" % address)
 
         return struct.unpack('P', data)[0]
-
-    # @cache_result
-    # @log_arg_ret
-    # def dereference_type(self, type_info):
-
-    #     # remove a '(*)' or '[\d+]' or '*'
-    #     if '(*)' in type_info:
-    #         return type_info.replace('(*)', '', 1).strip(), '(*)'
-
-    #     # example: 'struct _43rdewd ** [43] [5]'
-    #     match = re.match(r'^(\w+\s+)?\w+\s*(\*)*\s*(\[\d*\])?', type_info)
-    #     if match:
-    #         _, group2, group3 = match.groups()
-    #         if group3:
-    #             return type_info.replace(group3, '', 1).strip(), group3
-    #         elif group2:
-    #             return type_info.replace(group2, '', 1).strip(), group2
-    #     raise Exception("type '%s' is neither array nor pointer, "
-    #                     "can't dereference it" % type_info)
 
     def simplify_type(self, type_info):
         if type_info['kind'] in {
@@ -1065,7 +924,7 @@ class Dumper(object):
                                 "not a pointer, '%s' is not allowed" %
                                 (expr.variable, type_info,
                                  '->' if expr.member else '*'))
-            if type_info['kind'] == self.btf.BTF_KIND_PTR:
+            if type_info['kind'] != self.btf.BTF_KIND_PTR:
                 if expr.member:
                     raise Exception("type of '%s' is '%s', '.' "
                                     "should be used instead of '->'" %
@@ -1090,14 +949,9 @@ class Dumper(object):
                                 expr.variable)
             if type_info['kind'] not in {
                 self.btf.BTF_KIND_ARRAY, self.btf.BTF_KIND_PTR}:
-            # if '*' not in type_info and '[' not in type_info:
                 raise Exception("type of '%s' is '%s', neither pointer "
                                 "nor array, index is not allowed" %
                                 (expr.variable, type_info))
-
-            # if type_info['kind'] == self.btf.BTF_KIND_PTR:
-            #     addr = self.dereference_addr(addr)
-            #     # ele_size = self.btf.get_type_size(type_info['type_obj'])
 
             type_info = self.btf.dereference_type(type_info)
             type_info = self.simplify_type(type_info)
@@ -1113,6 +967,8 @@ class Dumper(object):
 
         elif isinstance(expr, Number):
             return expr.value, ''
+        
+        raise Exception("unsupported expression: %s" % expr)
 
     def dump_byte_array(self, data, array_len, indent):
         omit_tip = ''
@@ -1177,31 +1033,28 @@ class Dumper(object):
         return dump_txt
 
     def dump_basic_type(self, data, type_info):
-        # data = data[0:type_info['size']]
-        # print("dump basic, len %d, '%s', type: %s" % (len(data), data, type_info))
-
         if type_info['size'] == 1:
-            if type_info['bool']:
+            if type_info.get('bool', False):
                 return 'true' if struct.unpack('B', data)[0] else 'false'
-            elif type_info['signed']:
+            elif type_info.get('signed', False):
                 val = struct.unpack('b', data)[0]
             else:
                 val = struct.unpack('B', data)[0]
 
         elif type_info['size'] == 2:
-            if type_info['signed']:
+            if type_info.get('signed', False):
                 val = struct.unpack('h', data)[0]
             else:
                 val = struct.unpack('H', data)[0]
 
         elif type_info['size'] == 4:
-            if type_info['signed']:
+            if type_info.get('signed', False):
                 val = struct.unpack('i', data)[0]
             else:
                 val = struct.unpack('I', data)[0]
 
         elif type_info['size'] == 8:
-            if type_info['signed']:
+            if type_info.get('signed', False):
                 val = struct.unpack('l', data)[0]
             else:
                 val = struct.unpack('L', data)[0]
@@ -1211,35 +1064,11 @@ class Dumper(object):
 
         # TODO bitfield
         return str(val)
-        # if 'char' in type_desc or '_Bool' in type_desc:
-        #     if 'unsigned' in type_desc:
-        #         return str(struct.unpack('B', data[0])[0])
-        #     else:
-        #         return str(struct.unpack('b', data[0])[0])
-        # elif 'short' in type_desc:
-        #     if 'unsigned' in type_desc:
-        #         return str(struct.unpack('H', data[0:2])[0])
-        #     else:
-        #         return str(struct.unpack('h', data[0:2])[0])
-        # elif 'int' in type_desc:
-        #     if 'unsigned' in type_desc:
-        #         return str(struct.unpack('I', data[0:4])[0])
-        #     else:
-        #         return str(struct.unpack('i', data[0:4])[0])
-        # elif 'long' in type_desc:
-        #     if 'unsigned' in type_desc:
-        #         return str(struct.unpack('L', data[0:self.arch_size])[0])
-        #     else:
-        #         return str(struct.unpack('l', data[0:self.arch_size])[0])
-        # else:
-        #     return "ERROR /* unsupported type: '%s' */" % type_desc.strip()
 
     def dump_struct(self, data, type_info, indent):
         dump_txt = '{\n'
         indent += 1
         for m in type_info['members']:
-            # if not line or '{' in line or '}' in line:
-            #     continue
             m_name = m['name']
             try:
                 m_off, m_type = self.get_member_offset_and_type(type_info, m_name)
@@ -1259,29 +1088,6 @@ class Dumper(object):
                     (m_name, type_info['name'])
                 log_exception()
 
-            # line = self.simplify_type(line)
-            # # example: '  struct _43rdewd *foo [43] [5];'
-            # match = re.match(
-            #     r'^\s*((\w+\s+)?\w+\s+\**)\s*(\w+)((\s*\[\d+\])*);', line)
-            # if not match or not match.group(3):
-            #     dump_txt += indent * self.BLANK + \
-            #                 "// parse definition '%s' failed\n" % line.strip()
-            # else:
-            #     # member_type = (match.group(1) + match.group(4)).strip()
-            #     member = match.group(3).strip()
-            #     try:
-            #         offset, member_type = self.get_member_offset_and_type(
-            #             type_info, member)
-            #         member_size = self.btf.get_type_size(member_type)
-            #         dump_txt += indent * self.BLANK + '.' + member + ' = ' + \
-            #             self.dump_type(data[offset: offset + member_size],
-            #                            member_type, indent) + ',\n'
-            #     except Exception:
-            #         dump_txt += \
-            #             indent * self.BLANK + \
-            #             "// parse member '%s' of type '%s' failed\n" % \
-            #             (member, type_info)
-            #         log_exception()
         indent -= 1
         dump_txt += indent * self.BLANK + '}'
         return dump_txt
@@ -1290,36 +1096,15 @@ class Dumper(object):
         type_info = self.simplify_type(type_info)
         if type_info['kind'] in {
             self.btf.BTF_KIND_PTR, self.btf.BTF_KIND_FUNC_PROTO}:
-            # print("dump pointer, len %d, '%s'" % (len(data[:self.arch_size]), data[:self.arch_size]))
             # dump pointer
             return '0x%x' % struct.unpack('P', data[:self.arch_size])[0]
 
         if type_info['kind'] == self.btf.BTF_KIND_ARRAY:
-        # # example: 'struct _43rdewd ** [43] [5]'
-        # match = re.match(r'^(\w+\s+)?\w+\s*(\*)*\s*\[(\d+)\]', type_info)
-        # if match:
-        #     # dump array
-        #     type_info = type_info.replace('[%s]' % match.group(3), '')
             return self.dump_array(
                 data, type_info['type_obj'], type_info['nelems'], indent)
 
-        # if '*' in type_info:
-        #     # dump pointer
-        #     return '0x%x' % struct.unpack('P', data[:self.arch_size])[0]
-
-        if type_info['kind'] == self.btf.BTF_KIND_INT:
+        if type_info['kind'] in {self.btf.BTF_KIND_INT, self.btf.BTF_KIND_ENUM}:
             return self.dump_basic_type(data, type_info)
-        # try:
-        #     ptype = self.gdb_shell.run_cmd('ptype %s' % type_info)
-        #     pos = ptype.index('=')
-        #     ptype_lines = ptype[pos + 1:].strip().splitlines()
-        # except Exception as e:
-        #     append_err_txt(e, "failed to get type of '%s': " % type_info)
-        #     reraise()
-
-        # if len(ptype_lines) == 1:
-        #     # dump basic type
-        #     return self.dump_basic_type(data, ptype_lines[0])
 
         # dump struct
         if type_info['kind'] in {self.btf.BTF_KIND_STRUCT, self.btf.BTF_KIND_UNION}:
@@ -1334,10 +1119,8 @@ class Dumper(object):
             raise Exception("type of '%s' is not specified" % expr)
 
         type_size = self.btf.get_type_size(type_info)
-        # self.mem_fp.seek(addr)
         try:
             data = self.kernel_mem.read(addr, type_size)
-            # data = self.mem_fp.read(type_size)
         except Exception as e:
             append_err_txt(e, "read memory failed: ")
             reraise()
@@ -1399,33 +1182,43 @@ def do_dump(dumper, expression_list, watch_interval=None):
         time.sleep(watch_interval)
 
 
+def show_netdev():
+    dumper = Dumper()
+    expr = Parser(Lexer('((struct net) init_net).dev_base_head.next')).parse()
+    data, type = dumper.get_data_and_type(expr)
+    next_type = type
+    next = int(dumper.dump_type(data, type), base=0)
+
+    netdev_type = dumper.btf.get_type(BTF.BTF_KIND_STRUCT, "net_device")
+    offset = dumper.get_member_offset_and_type(netdev_type, 'dev_list')[0]
+
+    while next:
+        dev_addr = next - offset
+        expr = Parser(Lexer('((struct net_device) %d).name' % dev_addr)).parse()
+        data, type = dumper.get_data_and_type(expr)
+        dev_name = dumper.dump_type(data, type)
+        print("%s 0x%x" % (dev_name, dev_addr))
+
+        expr = Parser(Lexer('((struct list_head) %d).prev' % next)).parse()
+        data, type = dumper.get_data_and_type(expr)
+        next = int(dumper.dump_type(data, type), base=0)
+
 if __name__ == '__main__':
     epilog = """examples:
-    * type of g_var1 is 'struct foo**', dump the third struct:
-        %(prog)s `pidof prog` '*g_var1[2]'
-    * type of g_var2 is 'struct foo*', dump the first 5 elements:
-        %(prog)s `pidof prog` '(struct foo[5])*g_var2'
-    * g_var3 points to a nested struct, dump the member:
-        %(prog)s `pidof prog` 'g_var3->val.data'
-    * there is a 'struct foo' at address 0x556159b32020, dump it:
-        %(prog)s `pidof prog` '(struct foo)0x556159b32020'
-    * check the expression values every 0.1s, dump them when the values change:
-        %(prog)s -w 0.1 `pidof prog` '*g_var1[2]' '(struct foo[5])*g_var2'
+    * dump the kernel init_net structure:
+        %(prog)s '(struct net) init_net'
+    * 
     """ % {'prog': sys.argv[0]}
     parser = argparse.ArgumentParser(
-        description='dump global variables of a living process without interrupting it',
+        description='Dump global variables of kernel.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog)
-    parser.add_argument('pid', type=int, help='target process ID')
     parser.add_argument('expression', type=str, nargs='+',
-                        help='rvalue expression in C style')
+                        help='rvalue expression in C style with typecast')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='show debug information')
     parser.add_argument('-x', '--hex-string', action='store_true',
                         help='dump byte array in hex instead of string')
-    parser.add_argument('-e', '--elf-path',
-                        help='elf path to read symbols, '
-                             '`readlink /proc/$pid/exe` by default')
     parser.add_argument('-a', '--array-max', type=int, default=0,
                         help='maximum number of array elements to display')
     parser.add_argument('-s', '--string-max', type=int, default=0,
@@ -1433,6 +1226,8 @@ if __name__ == '__main__':
     parser.add_argument('-w', '--watch-interval', type=float,
                         help='check the expression value every WATCH_INTERVAL '
                              'seconds and dump it when it changes')
+    parser.add_argument('-t', '--btf', type=str,
+                        help='BTF file path', default='/sys/kernel/btf/vmlinux')
     args = parser.parse_args()
 
     verbose = args.verbose
@@ -1442,11 +1237,9 @@ if __name__ == '__main__':
     string_max_force = bool(args.string_max > 0)
 
     try:
-        dumper = Dumper(#pid=args.pid,
-                        elf_path=args.elf_path,
-                        array_max=array_max, array_max_force=array_max_force,
+        dumper = Dumper(array_max=array_max, array_max_force=array_max_force,
                         hex_string=args.hex_string, string_max=string_max,
-                        string_max_force=string_max_force)
+                        string_max_force=string_max_force, btf_path=args.btf)
         do_dump(dumper, args.expression, args.watch_interval)
     except Exception as e:
         print("Error: %s" % get_err_txt(e), file=sys.stderr)
