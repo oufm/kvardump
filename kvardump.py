@@ -6,7 +6,7 @@ import re
 import sys
 import time
 import copy
-import json
+import pickle
 import codecs
 import subprocess
 import argparse
@@ -21,16 +21,15 @@ DEFAULT_STRING_MAX = 64
 verbose = False
 log_nest_level = 0
 
-
-if sys.version_info[0] >= 3:
-    def reraise():
-        exc_info = sys.exc_info()
-        raise exc_info[1].with_traceback(exc_info[2])
-else:
-    exec("def reraise():\n"
-         "    exc_info = sys.exc_info()\n"
-         "    raise exc_info[0], exc_info[1], exc_info[2]\n")
-
+try:
+    from six import reraise
+except ImportError:
+    if sys.version_info[0] >= 3:
+        def reraise(exc_type, exc_value, exc_traceback):
+            raise exc_value.with_traceback(exc_traceback)
+    else:
+        exec("def reraise(exc_type, exc_value, exc_traceback):\n"
+            "    raise exc_type, exc_value, exc_traceback\n")
 
 def get_err_txt(err):
     return getattr(err, "show_txt", str(err))
@@ -131,7 +130,7 @@ def cache_result(func):
             cache_value = func(self, *args, **kwargs)
         except Exception as e:
             cache_dict[param_tuple] = copy.deepcopy(e)
-            reraise()
+            reraise(*sys.exc_info())
         else:
             cache_dict[param_tuple] = copy.deepcopy(cache_value)
         return cache_value
@@ -140,45 +139,74 @@ def cache_result(func):
 
 
 class BTF(object):
-    BTF_HEADER_LEN = 24
-    BTF_TYPE_LEN = 12
-    BTF_ARRAY_LEN = 12
-    BTF_MEMBER_LEN = 12
-    BTF_ENUM_LEN = 8
-    BTF_ARG_LEN = 8
+    KIND_INT = 1
+    KIND_PTR = 2
+    KIND_ARRAY = 3
+    KIND_STRUCT = 4
+    KIND_UNION = 5
+    KIND_ENUM = 6
+    KIND_FWD = 7
+    KIND_TYPEDEF = 8
+    KIND_VOLATILE = 9
+    KIND_CONST = 10
+    KIND_RESTRICT = 11
+    KIND_FUNC = 12
+    KIND_FUNC_PROTO = 13
+    KIND_VAR = 14
+    KIND_DATASEC = 15
 
-    BTF_KIND_INT = 1
-    BTF_KIND_PTR = 2
-    BTF_KIND_ARRAY = 3
-    BTF_KIND_STRUCT = 4
-    BTF_KIND_UNION = 5
-    BTF_KIND_ENUM = 6
-    BTF_KIND_FWD = 7
-    BTF_KIND_TYPEDEF = 8
-    BTF_KIND_VOLATILE = 9
-    BTF_KIND_CONST = 10
-    BTF_KIND_RESTRICT = 11
-    BTF_KIND_FUNC = 12
-    BTF_KIND_FUNC_PROTO = 13
-    BTF_KIND_VAR = 14
-    BTF_KIND_DATASEC = 15
-
-    def __init__(self, path):
+    def __init__(self, path, cache_path='/tmp/kvardump.cache', mem_reader=None,
+                 array_max=DEFAULT_ARRAY_MAX, string_max=DEFAULT_STRING_MAX,
+                 array_max_force=False, string_max_force=False,
+                 hex_string=False, blank='    '):
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
-        if os.path.exists('/tmp/kvardump_cache.json'):
-            with open('/tmp/kvardump_cache.json', 'r') as f:
-                obj = json.load(f)
-                self.decoded_types = obj['decoded_types']
-                self.name_map = obj['name_map']
-            return
+        # if os.path.exists('/tmp/kvardump_cache.json'):
+        #     with open('/tmp/kvardump_cache.json', 'r') as f:
+        #         obj = json.load(f)
+        #         self.types = obj['types']
+        #         self.name_map = obj['name_map']
+        #     return
 
+        self.mem_reader = mem_reader
+        self.array_max = array_max
+        self.string_max = string_max
+        self.array_max_force = array_max_force
+        self.string_max_force = string_max_force
+        self.hex_string = hex_string
+        self.blank = blank
+
+        # if cache_path and os.path.exists(cache_path):
+        #     print("loading types from cache '%s'" % cache_path, file=sys.stderr)
+        #     with open(cache_path, 'rb') as f:
+        #         obj = pickle.load(f)
+        #         self.types = obj.types
+        #         self.name_map = obj.name_map
+        #         return
+
+        #         obj = json.load(f)
+        #         self.types = obj['types']
+        #         self.name_map = obj['name_map']
+
+        # type ID start from 1
+        self.types = [{}]
+        self.name_map = {}
+
+        print("parsing types from cache '%s'" % path, file=sys.stderr)
+        self.parse(path)
+
+        # if cache_path:
+        #     print("writing types to cache '%s'" % cache_path, file=sys.stderr)
+        #     with open('/tmp/kvardump_cache.json', 'w') as f:
+        #         pickle.dump(self, f)
+
+    def parse(self, path):
         with open(path, 'rb') as f:
             self.data = f.read()
 
-        header = struct.unpack('HBBIIIII', self.data[0:self.BTF_HEADER_LEN])
+        header = struct.unpack('HBBIIIII', self.data[0:24])
         self.magic = header[0]
         self.version = header[1]
         self.flags = header[2]
@@ -188,6 +216,7 @@ class BTF(object):
         self.str_off = header[6]
         self.str_len = header[7]
         self.data = self.data[self.hdr_len:]
+        self.pos = 0
 
         if (self.type_off + self.type_len > len(self.data)):
             raise Exception("invalid BTF, may be truncated")
@@ -198,18 +227,30 @@ class BTF(object):
         if self.magic != 0xeb9f:
             raise Exception("invalid BTF file, wrong magic: 0x%x" % self.magic)
 
-        self.str_data = self.data[self.str_off:self.str_off+self.str_len]
-        self.type_data = self.data[self.type_off:self.type_off+self.type_len]
-        # type ID start from 1
-        self.decoded_types = [{}]
-        self.name_map = {}
+        self.str_data = self.data[self.str_off : self.str_off + self.str_len]
+        self.type_data = self.data[self.type_off : self.type_off + self.type_len]
 
-        pos = 0
-        while pos + self.BTF_TYPE_LEN < len(self.type_data):
-            btf_type = struct.unpack(
-                "III", self.type_data[pos:pos+self.BTF_TYPE_LEN])
-            pos += self.BTF_TYPE_LEN
+        type_map = {
+            BTF.KIND_INT: Int,
+            BTF.KIND_PTR: Ptr,
+            BTF.KIND_ARRAY: Array,
+            BTF.KIND_STRUCT: Struct,
+            BTF.KIND_UNION: Union,
+            BTF.KIND_ENUM: Enum,
+            BTF.KIND_FWD: Fwd,
+            BTF.KIND_TYPEDEF: TypeDef,
+            BTF.KIND_VOLATILE: Volatile,
+            BTF.KIND_CONST: Const,
+            BTF.KIND_RESTRICT: Restrict,
+            BTF.KIND_FUNC: Func,
+            BTF.KIND_FUNC_PROTO: FuncProto,
+            BTF.KIND_VAR: Var,
+            BTF.KIND_DATASEC: DataSec,
+        }
 
+        while self.pos < len(self.type_data):
+            data = self.eat(12)
+            btf_type = struct.unpack("III", data)
             name_off = btf_type[0]
             info = btf_type[1]
             size = type = btf_type[2]
@@ -217,155 +258,170 @@ class BTF(object):
             kind = (info >> 24) & 0xf
             kind_flag = info >> 31
             name = self.get_name(name_off)
-            decoded = {"name": name, "kind": kind}
 
-            if kind == self.BTF_KIND_INT:
-                if pos + 4 >= len(self.type_data):
-                    raise Exception(
-                        "invalid BTF, 0x%x reaches the end of type data" % pos)
+            cls = type_map[kind]
+            obj = cls.from_btf(self, name, size, type, vlen, kind_flag)
 
-                info = struct.unpack("I", self.type_data[pos:pos+4])[0]
-                pos += 4
+            #self.name_map['%d.%s' % (kind, name)] = len(self.types)
+            self.name_map[(kind, name)] = len(self.types)
+            self.types.append(obj)
 
-                decoded.update({
-                    'kind': kind,
-                    'size': size,
-                    'signed': (info & 0x01000000) != 0,
-                    'char': (info & 0x02000000) != 0,
-                    'bool': (info & 0x04000000) != 0,
-                    'offset': (info >> 16) & 0xff,
-                    'bits': info >> 16,
-                })
-            elif kind in {
-                self.BTF_KIND_PTR,
-                self.BTF_KIND_TYPEDEF,
-                self.BTF_KIND_VOLATILE,
-                self.BTF_KIND_CONST,
-                self.BTF_KIND_RESTRICT,
-                }:
-                decoded.update({
-                    'kind': kind,
-                    'type': type,
-                })
-            elif kind == self.BTF_KIND_ARRAY:
-                if pos + self.BTF_ARRAY_LEN >= len(self.type_data):
-                    raise Exception(
-                        "invalid BTF, 0x%x reaches the end of type data" % pos)
+        ###############
+        # pos = 0
+        # while pos + self.TYPE_LEN < len(self.type_data):
+        #     btf_type = struct.unpack(
+        #         "III", self.type_data[pos:pos+self.TYPE_LEN])
+        #     pos += self.TYPE_LEN
 
-                info = struct.unpack(
-                    "III", self.type_data[pos:pos+self.BTF_ARRAY_LEN])
-                pos += self.BTF_ARRAY_LEN
-                decoded.update({
-                    'kind': kind,
-                    'type': info[0],
-                    'nelems': info[2],
-                })
-            elif kind == self.BTF_KIND_STRUCT or kind == self.BTF_KIND_UNION:
-                if pos + vlen * self.BTF_MEMBER_LEN >= len(self.type_data):
-                    raise Exception(
-                        "invalid BTF, 0x%x reaches the end of type data" % pos)
+        #     name_off = btf_type[0]
+        #     info = btf_type[1]
+        #     size = type = btf_type[2]
+        #     vlen = info & 0xffff
+        #     kind = (info >> 24) & 0xf
+        #     kind_flag = info >> 31
+        #     name = self.get_name(name_off)
+        #     decoded = {"name": name, "kind": kind}
 
-                decoded.update({
-                    'kind': kind,
-                    'vlen': vlen,
-                    'size': size,
-                    'members': [],
-                })
+        #     if kind == self.KIND_INT:
+        #         if pos + 4 >= len(self.type_data):
+        #             raise Exception(
+        #                 "invalid BTF, 0x%x reaches the end of type data" % pos)
 
-                for i in range(vlen):
-                    info = struct.unpack(
-                        "III", self.type_data[pos:pos+self.BTF_MEMBER_LEN])
-                    pos += self.BTF_MEMBER_LEN
-                    decoded['members'].append({
-                        'name': self.get_name(info[0]),
-                        'type': info[1],
-                        'offset': info[2] & 0xffffff,
-                        'size': info[2] >> 24,
-                    })
-            elif kind == self.BTF_KIND_ENUM:
-                if pos + vlen * self.BTF_ENUM_LEN >= len(self.type_data):
-                    raise Exception(
-                        "invalid BTF, 0x%x reaches the end of type data" % pos)
+        #         info = struct.unpack("I", self.type_data[pos:pos+4])[0]
+        #         pos += 4
 
-                decoded.update({
-                    'kind': kind,
-                    'vlen': vlen,
-                    'size': size,
-                    'members': [],
-                })
+        #         decoded.update({
+        #             'kind': kind,
+        #             'size': size,
+        #             'signed': (info & 0x01000000) != 0,
+        #             'char': (info & 0x02000000) != 0,
+        #             'bool': (info & 0x04000000) != 0,
+        #             'offset': (info >> 16) & 0xff,
+        #             'bits': info >> 16,
+        #         })
+        #     elif kind in {
+        #         self.KIND_PTR,
+        #         self.KIND_TYPEDEF,
+        #         self.KIND_VOLATILE,
+        #         self.KIND_CONST,
+        #         self.KIND_RESTRICT,
+        #         }:
+        #         decoded.update({
+        #             'kind': kind,
+        #             'type': type,
+        #         })
+        #     elif kind == self.KIND_ARRAY:
+        #         if pos + self.ARRAY_LEN >= len(self.type_data):
+        #             raise Exception(
+        #                 "invalid BTF, 0x%x reaches the end of type data" % pos)
 
-                for i in range(vlen):
-                    info = struct.unpack(
-                        "Ii", self.type_data[pos:pos+self.BTF_ENUM_LEN])
-                    pos += self.BTF_ENUM_LEN
-                    decoded['members'].append({
-                        'name': self.get_name(info[0]),
-                        'val': info[1],
-                    })
-            elif kind == self.BTF_KIND_FWD:
-                decoded.update({
-                    'kind': self.BTF_KIND_UNION \
-                        if kind_flag else self.BTF_KIND_STRUCT,
-                    'vlen': 0,
-                    'size': 0,
-                    'members': [],
-                })
-            elif kind == self.BTF_KIND_FUNC_PROTO:
-                if pos + vlen * self.BTF_ARG_LEN >= len(self.type_data):
-                    raise Exception(
-                        "invalid BTF, 0x%x reaches the end of type data" % pos)
+        #         info = struct.unpack(
+        #             "III", self.type_data[pos:pos+self.ARRAY_LEN])
+        #         pos += self.ARRAY_LEN
+        #         decoded.update({
+        #             'kind': kind,
+        #             'type': info[0],
+        #             'nelems': info[2],
+        #         })
+        #     elif kind == self.KIND_STRUCT or kind == self.KIND_UNION:
+        #         if pos + vlen * self.MEMBER_LEN >= len(self.type_data):
+        #             raise Exception(
+        #                 "invalid BTF, 0x%x reaches the end of type data" % pos)
 
-                decoded.update({
-                    'kind': kind,
-                    'vlen': vlen,
-                    'type': type,
-                    'args': [],
-                })
+        #         decoded.update({
+        #             'kind': kind,
+        #             'vlen': vlen,
+        #             'size': size,
+        #             'members': [],
+        #         })
 
-                pos += self.BTF_ARG_LEN * vlen
-                # for i in range(vlen):
-                #     info = struct.unpack(
-                #         "II", self.type_data[pos:pos+self.BTF_ARG_LEN])
-                #     pos += self.BTF_ARG_LEN
-                #     decoded['args'].append({
-                #         'name': self.get_name(info[0]),
-                #         'type': info[1],
-                #     })
-            elif kind == self.BTF_KIND_FUNC:
-                pass
-            elif kind == self.BTF_KIND_VAR:
-                pos += 4
-                # import pdb
-                # pdb.set_trace()
-            elif kind == self.BTF_KIND_DATASEC:
-                pos += 12 * vlen
+        #         for i in range(vlen):
+        #             info = struct.unpack(
+        #                 "III", self.type_data[pos:pos+self.MEMBER_LEN])
+        #             pos += self.MEMBER_LEN
+        #             decoded['members'].append({
+        #                 'name': self.get_name(info[0]),
+        #                 'type': info[1],
+        #                 'offset': info[2] & 0xffffff,
+        #                 'size': info[2] >> 24,
+        #             })
+        #     elif kind == self.KIND_ENUM:
+        #         if pos + vlen * self.ENUM_LEN >= len(self.type_data):
+        #             raise Exception(
+        #                 "invalid BTF, 0x%x reaches the end of type data" % pos)
 
-            self.name_map['%d.%s' % (kind, name)] = len(self.decoded_types)
-            self.decoded_types.append(decoded)
+        #         decoded.update({
+        #             'kind': kind,
+        #             'vlen': vlen,
+        #             'size': size,
+        #             'members': [],
+        #         })
 
-        with open('/tmp/kvardump_cache.json', 'w') as f:
-            json.dump({'name_map': self.name_map,
-                'decoded_types': self.decoded_types}, f)
+        #         for i in range(vlen):
+        #             info = struct.unpack(
+        #                 "Ii", self.type_data[pos:pos+self.ENUM_LEN])
+        #             pos += self.ENUM_LEN
+        #             decoded['members'].append({
+        #                 'name': self.get_name(info[0]),
+        #                 'val': info[1],
+        #             })
+        #     elif kind == self.KIND_FWD:
+        #         decoded.update({
+        #             'kind': self.KIND_UNION \
+        #                 if kind_flag else self.KIND_STRUCT,
+        #             'vlen': 0,
+        #             'size': 0,
+        #             'members': [],
+        #         })
+        #     elif kind == self.KIND_FUNC_PROTO:
+        #         if pos + vlen * self.ARG_LEN >= len(self.type_data):
+        #             raise Exception(
+        #                 "invalid BTF, 0x%x reaches the end of type data" % pos)
 
-    def get_name(self, off):
-        if off >= len(self.str_data):
-            raise Exception("invalid BTF file, invalid name offset: 0x%x" % off)
+        #         decoded.update({
+        #             'kind': kind,
+        #             'vlen': vlen,
+        #             'type': type,
+        #             'args': [],
+        #         })
 
-        end = self.str_data[off:].find(b'\x00')
+        #         pos += self.ARG_LEN * vlen
+        #         # for i in range(vlen):
+        #         #     info = struct.unpack(
+        #         #         "II", self.type_data[pos:pos+self.ARG_LEN])
+        #         #     pos += self.ARG_LEN
+        #         #     decoded['args'].append({
+        #         #         'name': self.get_name(info[0]),
+        #         #         'type': info[1],
+        #         #     })
+        #     elif kind == self.KIND_FUNC:
+        #         pass
+        #     elif kind == self.KIND_VAR:
+        #         pos += 4
+        #         # import pdb
+        #         # pdb.set_trace()
+        #     elif kind == self.KIND_DATASEC:
+        #         pos += 12 * vlen
+
+    def get_name(self, offset):
+        if offset >= len(self.str_data):
+            raise Exception("invalid BTF file, invalid name offset: 0x%x" % offset)
+
+        end = self.str_data[offset:].find(b'\x00')
         if end < 0:
-            raise Exception("invalid BTF file, invalid string at 0x%x" % off)
+            raise Exception("invalid BTF file, invalid string at 0x%x" % offset)
 
-        return self.str_data[off:off+end].decode('ascii')
+        return self.str_data[offset : offset + end].decode('ascii')
 
     # @log_arg_ret
     def assemble_type(self, type_info):
-        if type_info.get('kind', None) == self.BTF_KIND_PTR:
+        if type_info.get('kind', None) == self.KIND_PTR:
             return type_info
 
         if 'type' in type_info and 'type_obj' not in type_info:
             type = type_info.pop('type')
             type_info['type_obj'] = \
-                self.assemble_type(self.decoded_types[type])
+                self.assemble_type(self.types[type])
             type_info['type'] = type
 
         members = type_info.get('members', [])
@@ -375,67 +431,712 @@ class BTF(object):
         return type_info
 
     def get_type(self, kind, name):
-        type_id = self.name_map['%d.%s' % (kind, name)]
-        type_info = self.decoded_types[type_id]
-        return self.assemble_type(type_info)
+        type_id = self.name_map[(kind, name)]
+        return self.types[type_id]
+        # type_id = self.name_map['%d.%s' % (kind, name)]
+        # type_info = self.types[type_id]
+        # return self.assemble_type(type_info)
 
     def dereference_type(self, type_info):
         if 'type_obj' not in type_info:
             ref_type_id = type_info['type']
-            ref_type_info = self.decoded_types[ref_type_id]
+            ref_type_info = self.types[ref_type_id]
             type_info['type_obj'] = self.assemble_type(ref_type_info)
 
         return type_info['type_obj']
 
-    @log_arg_ret
-    def get_type_size(self, type_info):
-        if type_info['kind'] in {self.BTF_KIND_PTR, self.BTF_KIND_FUNC_PROTO}:
-            return self.arch_size
-        elif type_info['kind'] == self.BTF_KIND_ARRAY:
-            return type_info['nelems'] * self.get_type_size(type_info['type_obj'])
-        elif type_info['kind'] in {
-            self.BTF_KIND_INT,
-            self.BTF_KIND_STRUCT,
-            self.BTF_KIND_UNION,
-            self.BTF_KIND_ENUM,
-            }:
-            return type_info['size']
-        elif type_info['kind'] in {
-            self.BTF_KIND_TYPEDEF,
-            self.BTF_KIND_VOLATILE,
-            self.BTF_KIND_CONST,
-            self.BTF_KIND_RESTRICT
-            }:
-            return self.get_type_size(type_info['type_obj'])
-        else:
-            return 0
+    # @log_arg_ret
+    # def get_type_size(self, type_info):
+    #     if type_info['kind'] in {self.KIND_PTR, self.KIND_FUNC_PROTO}:
+    #         return self.arch_size
+    #     elif type_info['kind'] == self.KIND_ARRAY:
+    #         return type_info['nelems'] * self.get_type_size(type_info['type_obj'])
+    #     elif type_info['kind'] in {
+    #         self.KIND_INT,
+    #         self.KIND_STRUCT,
+    #         self.KIND_UNION,
+    #         self.KIND_ENUM,
+    #         }:
+    #         return type_info['size']
+    #     elif type_info['kind'] in {
+    #         self.KIND_TYPEDEF,
+    #         self.KIND_VOLATILE,
+    #         self.KIND_CONST,
+    #         self.KIND_RESTRICT
+    #         }:
+    #         return self.get_type_size(type_info['type_obj'])
+    #     else:
+    #         return 0
 
-    def get_type_str(self, type_info):
-        self.assemble_type(type_info)
+    # def get_type_str(self, type_info):
+    #     self.assemble_type(type_info)
 
-        if type_info['kind'] == self.BTF_KIND_PTR:
-            return "%s *" % self.get_type_str(self.decoded_types[type_info['type']])
-        elif type_info['kind'] == self.BTF_KIND_STRUCT:
-            return "struct %s" % type_info['name']
-        elif type_info['kind'] == self.BTF_KIND_UNION:
-            return "union %s" % type_info['name']
-        elif type_info['kind'] == self.BTF_KIND_ENUM:
-            return "enum %s" % type_info['name']
-        elif type_info['kind'] == self.BTF_KIND_VOLATILE:
-            return "volatile %s" % self.get_type_str(type_info['type_obj'])
-        elif type_info['kind'] == self.BTF_KIND_CONST:
-            return "const %s" % self.get_type_str(type_info['type_obj'])
-        elif type_info['kind'] == self.BTF_KIND_RESTRICT:
-            return "restrict %s" % self.get_type_str(type_info['type_obj'])
-        elif type_info['kind'] == self.BTF_KIND_FUNC_PROTO:
-            return "void *"
-        elif type_info['kind'] == self.BTF_KIND_ARRAY:
-            # TODO priority
-            return "%s[%d]" % (self.get_type_str(type_info['type_obj']), type_info['nelems'])
-        elif 'name' in type_info:
-            return type_info['name']
+    #     if type_info['kind'] == self.KIND_PTR:
+    #         return "%s *" % self.get_type_str(self.types[type_info['type']])
+    #     elif type_info['kind'] == self.KIND_STRUCT:
+    #         return "struct %s" % type_info['name']
+    #     elif type_info['kind'] == self.KIND_UNION:
+    #         return "union %s" % type_info['name']
+    #     elif type_info['kind'] == self.KIND_ENUM:
+    #         return "enum %s" % type_info['name']
+    #     elif type_info['kind'] == self.KIND_VOLATILE:
+    #         return "volatile %s" % self.get_type_str(type_info['type_obj'])
+    #     elif type_info['kind'] == self.KIND_CONST:
+    #         return "const %s" % self.get_type_str(type_info['type_obj'])
+    #     elif type_info['kind'] == self.KIND_RESTRICT:
+    #         return "restrict %s" % self.get_type_str(type_info['type_obj'])
+    #     elif type_info['kind'] == self.KIND_FUNC_PROTO:
+    #         return "void *"
+    #     elif type_info['kind'] == self.KIND_ARRAY:
+    #         # TODO priority
+    #         return "%s[%d]" % (self.get_type_str(type_info['type_obj']), type_info['nelems'])
+    #     elif 'name' in type_info:
+    #         return type_info['name']
+    #     else:
+    #         raise Exception("unsupported type: %s" % type_info)
+
+    def eat(self, size):
+        if self.pos + size > len(self.type_data):
+             raise Exception(
+                "invalid BTF, 0x%x reaches the end of data" % (self.pos + size))
+        data = self.type_data[self.pos : self.pos + size]
+        self.pos += size
+        return data
+
+class BaseValue(object):
+    def __init__(self, type, data=None, addr=None):
+        if not data and not addr:
+            raise Exception("both data add addr are not specified")
+
+        self.type = type
+        self.btf = type.btf
+        self._data = data
+        self.addr = addr
+
+    def __str__(self):
+        return self.to_str()
+
+    @property
+    def data(self):
+        if self._data:
+            return self._data
+        try:
+            self._data = self.btf.mem_reader.read(self.addr, self.type.size)
+        except AttributeError:
+            msg = "read data 0x%x~0x%x failed: %s" % (
+                self.addr, self.addr + self.type.size, str(sys.exc_info()[1]))
+            reraise(Exception, msg, sys.exc_info()[2])
+        return self._data
+
+    def to_str(self, indent=0):
+        import pdb
+        pdb.set_trace()
+        raise NotImplementedError()
+
+    def cast(self, type):
+        if not self.addr:
+            raise Exception("address of '%s' has not been set" % repr(self))
+        return type(addr=self.addr)
+
+class BTFType(object):
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        raise NotImplementedError()
+
+    def __str__(self):
+        if not self.name:
+            return "%s-%s" % (self.__class__.__name__, id(self))
+
+        return self.name
+
+    def __call__(self, data=None, addr=None):
+        if isinstance(data, BaseValue):
+            return self.Value(self, addr=data.addr)
+
+        return self.Value(self, data, addr)
+
+    @property
+    def ref(self):
+        if not hasattr(self, 'type'):
+            raise NotImplementedError()
+        
+        if isinstance(self.type, int):
+            if self.type >= len(self.btf.types) or self.type <= 0:
+                raise Exception("invalid btf type %d" % self.type)
+            self.type = self.btf.types[self.type]
+
+        return self.type
+
+    def is_kind(self, kind):
+        return self.KIND == kind
+
+class Int(BTFType):
+    KIND = BTF.KIND_INT
+
+    def __init__(self, btf, name, size, signed=False, char=False,
+                 bool=False, offset=0, bits=0):
+        self.btf = btf
+        self.name = name
+        self.size = size
+        self.signed = signed
+        self.char = char
+        self.bool = bool
+        self.offset = offset
+        self.bits = bits
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        data = btf.eat(4)
+        info = struct.unpack("I", data)[0]
+        return cls(btf, name, size,
+                    signed=(info & 0x01000000) != 0,
+                    char=(info & 0x02000000) != 0,
+                    bool=(info & 0x04000000) != 0,
+                    offset=(info >> 16) & 0xff,
+                    bits=(info & 0xff))
+
+    class Value(BaseValue):
+        def __int__(self):
+            if self.type.size == 1:
+                if self.type.signed:
+                    val = struct.unpack('b', self.data)[0]
+                else:
+                    val = struct.unpack('B', self.data)[0]
+            elif self.type.size == 2:
+                if self.type.signed:
+                    val = struct.unpack('h', self.data)[0]
+                else:
+                    val = struct.unpack('H', self.data)[0]
+            elif self.type.size == 4:
+                if self.type.signed:
+                    val = struct.unpack('i', self.data)[0]
+                else:
+                    val = struct.unpack('I', self.data)[0]
+            elif self.type.size == 8:
+                if self.type.signed:
+                    val = struct.unpack('l', self.data)[0]
+                else:
+                    val = struct.unpack('L', self.data)[0]
+            else:
+                raise Exception("invalid int size: %s", self.type.size)
+
+            # TODO bitfield
+            return val
+
+        def to_str(self, indent=0):
+            if self.type.bool:
+                return str(bool(int(self)))
+            return str(int(self))
+
+class Ref(BTFType):
+    def __init__(self, btf, name, type):
+        self.btf = btf
+        self.name = name
+        self.type = type
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        return cls(btf, name, type)
+
+class Ptr(Ref):
+    KIND = BTF.KIND_PTR
+
+    def __str__(self):
+        return "%s *" % str(self.ref)
+
+    @property
+    def size(self):
+        return self.btf.arch_size
+
+    class Value(BaseValue):
+        def __int__(self):
+            # try:
+            return struct.unpack('P', self.data)[0]
+            # except:
+            #     import pdb
+            #     pdb.set_trace()
+
+        def to_str(self, indent):
+            return '0x%x' % int(self)
+
+        def __getitem__(self, idx):
+            addr = int(self) + idx * self.type.ref.size
+            return self.type.ref(addr=addr)
+
+        def __getattr__(self, name):
+            return getattr(self.eval(), name)
+
+        # @property
+        # def addr(self):
+        #     return struct.unpack('P', self.data)[0]
+
+        @property
+        def eval(self):
+            # data = self.btf.mem_reader.read(self.addr, self.type.ref.size)
+            try:
+                return self.type.ref(addr=int(self))
+            except AttributeError:
+                msg = "dereference value failed: %s" % (
+                    str(sys.exc_info()[1]))
+                reraise(Exception, msg, sys.exc_info()[2])
+
+class Bedeck(Ref):
+    def __setstate__(self, d):
+        self.__dict__ = d
+
+    def __getstate__(self):
+        return self.__dict__
+
+    def __getattr__(self, name):
+        return getattr(self.ref, name)
+        # return self.ref.get(name)
+
+    def __getitem__(self, idx):
+        return self.ref[idx]
+
+    def __len__(self):
+        return len(self.ref)
+
+    def is_kind(self, kind):
+        if self.KIND == kind:
+            return True
+        return self.ref.is_kind(kind)
+
+    # def __iter__(self):
+    #     return iter(self.ref)
+
+    # def get(self, member):
+    #     return self.ref.get(member)
+
+    # @property
+    # def size(self):
+    #     return self.ref.size
+
+    class Value(BaseValue):
+        @property
+        def ref(self):
+            try:
+                return self.type.ref(data=self.data, addr=self.addr)
+            except AttributeError:
+                msg = "ref failed: %s" % (str(sys.exc_info()[1]))
+                reraise(Exception, msg, sys.exc_info()[2])
+
+        def __getattr__(self, name):
+            return getattr(self.ref, name)
+
+        # @property
+        # def addr(self):
+        #     return self.ref.addr
+
+        # @property
+        # def eval(self):
+        #     return self.ref.eval
+
+        def __int__(self):
+            return int(self.ref)
+
+        def __str__(self):
+            return str(self.ref)
+
+        def __getitem__(self, idx):
+            return self.ref[idx]
+        # def __iter__(self):
+        #     return iter(self.ref)
+
+        def __len__(self):
+            return len(self.ref)
+
+        def to_str(self, indent=0):
+            return self.ref.to_str(indent)
+
+class TypeDef(Bedeck):
+    KIND = BTF.KIND_TYPEDEF
+
+class Volatile(Bedeck):
+    KIND = BTF.KIND_VOLATILE
+
+    def __str__(self):
+        return "volatile %s" % str(self.ref)
+
+class Const(Bedeck):
+    KIND = BTF.KIND_CONST
+
+    def __str__(self):
+        return "const %s" % str(self.ref)
+
+class Restrict(Bedeck):
+    KIND = BTF.KIND_RESTRICT
+
+    def __str__(self):
+        return "restrict %s" % str(self.ref)
+
+class Array(BTFType):
+    KIND = BTF.KIND_ARRAY
+    def __init__(self, btf, name, type, nelems):
+        self.btf = btf
+        self.name = name
+        self.type = type
+        self.nelems = nelems
+
+    def __str__(self):
+        return "%s[%d]" % (str(self.ref), self.nelems)
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        data = btf.eat(12)
+        info = struct.unpack("III", data)
+        return cls(btf, name, info[0], info[2])
+
+    @property
+    def size(self):
+        try:
+            return self.nelems * self.ref.size
+        except AttributeError:
+            msg = "get size failed: %s" % (str(sys.exc_info()[1]))
+            reraise(Exception, msg, sys.exc_info()[2])
+
+    class Value(BaseValue):
+        def __len__(self):
+            return self.type.nelems
+
+        def __getitem__(self, idx):
+            elem_size = self.type.ref.size
+            addr = self.addr + idx * elem_size if self.addr else None
+            data = self.data[idx * elem_size : (idx + 1) * elem_size]
+            return self.type.ref(data=data, addr=addr)
+
+        # def __iter__(self):
+        #     elem_size = self.type.ref.size
+        #     for i in range(self.type.nelems):
+        #         addr = None
+        #         data = self.data[i * elem_size : (i + 1) * elem_size]
+        #         if self.addr:
+        #             addr = self.addr + i * elem_size
+        #         yield self.type.ref(data=data, addr=addr)
+
+        def dump_byte_array(self, indent):
+            omit_tip = ''
+            if (indent > 0 or self.btf.string_max_force) and \
+                    self.type.nelems > self.btf.string_max:
+                data = self.data[:self.btf.string_max]
+                omit_tip = '...'
+
+            if not self.btf.hex_string:
+                try:
+                    # dump as string if there is no unprintable character
+                    str_val = self.data.decode('ascii')
+                    end = str_val.find('\x00')
+                    if end >= 0:
+                        str_val = str_val[:end]
+                    if not re.search(r'[^\t-\r\x20-\x7e]', str_val):
+                        return '"%s"' % (str_val + (omit_tip if end < 0 else ''))
+                except Exception:
+                    pass
+
+            # dump as hex
+            return '"<binary>" /* hex: %s */' % \
+                (codecs.encode(data, 'hex').decode() + omit_tip)
+
+        def to_str(self, indent):
+            elem_type = self.type.ref
+            elem_size = elem_type.size
+            array_len = self.type.nelems
+            omit_count = 0
+            # if elem_size == 1:
+            if elem_type.is_kind(BTF.KIND_INT) and elem_size == 1:
+            # if element_type['kind'] == self.btf.KIND_INT and \
+            #         element_type['size'] == 1:
+                return self.dump_byte_array(indent)
+
+            # dump array in each line
+            if (indent > 0 or self.btf.array_max_force) and \
+                    array_len > self.btf.array_max:
+                omit_count = array_len - self.btf.array_max
+                array_len = self.btf.array_max
+
+            indent += 1
+            if elem_type.is_kind(BTF.KIND_INT):
+                txt = '{'
+                sep = ' '
+                before = ''
+            else:
+                txt = '{\n'
+                sep = '\n'
+                before = indent * self.btf.blank
+
+            for i in range(array_len):
+                txt += before + self[i].to_str(indent) + ',' + sep
+                # self.dump_type(
+                #     data[elem_size * i: elem_size * i + elem_size],
+                #     element_type, indent) + ',' + sep
+
+            if omit_count:
+                txt += before + '/* other %s elements are omitted */%s' % (
+                                omit_count, sep)
+            indent -= 1
+            if sep == '\n':
+                txt += indent * self.btf.blank + '}'
+            else:
+                txt += '}'
+            return txt
+
+class StructUnion(BTFType):
+    class Member(BTFType):
+        def __init__(self, parent, btf, name, type, offset, size):
+            self.parent = parent
+            self.btf = btf
+            self.name = name
+            self.type = type
+            self.offset_bits = offset
+            self.offset = offset / 8
+            self.size = size
+
+    def __init__(self, btf, name, vlen, size):
+        self.btf = btf
+        self.name = name
+        self.vlen = vlen
+        self.size = size
+        self.members = []
+        self.member_map = {}
+        self.anonymous_members = []
+
+    def __len__(self):
+        return len(self.members)
+
+    def __getitem__(self, idx):
+        return self.members[idx]
+    # def __iter__(self):
+    #     return iter(self.members)
+
+    def __setstate__(self, d):
+        self.__dict__ = d
+
+    def __getstate__(self):
+        return self.__dict__
+
+    def __getattr__(self, name):
+        # print("%s get %s" % (repr(self), name))
+        return self.get(name)
+
+    def get(self, member):
+        member = str(member)
+        ret = self.member_map.get(member, None)
+        if ret:
+            return ret
+
+        for m in self.anonymous_members:
+            if isinstance(m.ref, StructUnion):
+                try:
+                    return m.ref.get(member)
+                except KeyError:
+                    pass
+
+        # import pdb
+        # pdb.set_trace()
+        raise KeyError("'%s' has no member '%s'" % (str(self), member))
+
+    def add_member(self, name, type, offset, size):
+        self.members.append(
+            self.Member(self, self.btf, name, type, offset, size))
+        if not name:
+            self.anonymous_members.append(self.members[-1])
         else:
-            raise Exception("unsupported type: %s" % type_info)
+            self.member_map[name] = self.members[-1]
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        obj = cls(btf, name, vlen, size)
+        for _ in range(vlen):
+            data = btf.eat(12)
+            info = struct.unpack("III", data)
+            obj.add_member(
+                btf.get_name(info[0]), info[1], info[2] & 0xffffff, info[2] >> 24)
+        return obj
+
+    class Value(BaseValue):
+        def __len__(self):
+            return len(self.type.members)
+
+        def __getitem__(self, idx):
+            # TODO offset_bits
+            member = self.type.members[idx]
+            return self._get(member)
+
+        def __getattr__(self, name):
+            print("call __getattr__")
+            return self.get(name)
+
+        def _get(self, member):
+            addr = self.addr + member.offset if self.addr else None
+            # TODO member.ref.size or member.size ?
+            try:    
+                data = self.data[member.offset : member.offset + member.ref.size]
+            except Exception:
+                import pdb
+                pdb.set_trace()
+            return member.ref(data=data, addr=addr)
+
+        def get(self, name):
+            member = self.type.get(name)
+            return self._get(member)
+
+        def to_str(self, indent=0):
+            txt = '{\n'
+            indent += 1
+            for m in self.type.members:
+                # m_name = m['name']
+                # m_off, m_type = self.get_member_offset_and_type(type_info, m_name)
+                # m_size = self.btf.get_type_size(m_type)
+                if m.name:
+                    txt += indent * self.btf.blank + '.' + m.name + ' = '
+                elif m.ref.is_kind(BTF.KIND_STRUCT):
+                    txt += indent * self.btf.blank  + '/* nested anonymous struct */ '
+                else:
+                    txt += indent * self.btf.blank  + '/* nested anonymous union */ '
+                txt += self._get(m).to_str(indent)
+                # self.dump_type(data[m_off: m_off + m_size], m_type, indent)
+                txt += ',\n'
+
+            indent -= 1
+            txt += indent * self.btf.blank  + '}'
+            return txt
+
+        # def __iter__(self):
+        #     elem_size = self.type.ref.size
+        #     for i in self.type.nelems:
+        #         data = data[i * elem_size : (i + 1) * elem_size]
+        #         yield self.type.ref(data)
+
+class Struct(StructUnion):
+    KIND = BTF.KIND_STRUCT
+
+    def __str__(self):
+        return "struct %s" % str(self.name)
+
+class Union(StructUnion):
+    KIND = BTF.KIND_UNION
+
+    def __str__(self):
+        return "union %s" % str(self.name)
+
+class Enum(Int):
+    KIND = BTF.KIND_ENUM
+    class Member(BTFType):
+        def __init__(self, parent, btf, name, val):
+            self.parent = parent
+            self.btf = btf
+            self.name = name
+            self.val = val
+
+    def __init__(self, btf, name, vlen, size):
+        self.vlen = vlen
+        self.members = []
+        self.member_map = {}
+        self.value_map = {}
+        super(self.__class__, self).__init__(btf, name, size)
+
+    def __str__(self):
+        return "enum %s" % str(self.name)
+
+    def add_member(self, name, val):
+        self.members.append(self.Member(self, self.btf, name, val))
+        self.member_map[name] = self.members[-1]
+        self.value_map[val] = self.members[-1]
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        obj = cls(btf, name, vlen, size)
+        for _ in range(vlen):
+            data = btf.eat(8)
+            info = struct.unpack("Ii", data)
+            obj.add_member(btf.get_name(info[0]), info[1])
+        return obj
+
+    class Value(Int.Value):
+        def __int__(self):
+            if isinstance(self.data, Int):
+                return self.data
+            return super(self.__class__, self).__int__()
+
+        def to_str(self, indent=0):
+            val = int(self)
+            if val in self.type.value_map:
+                return self.type.value_map[val].name
+
+            return super().to_str(indent)
+
+class Fwd(BTFType):
+    KIND = BTF.KIND_FWD
+    def __init__(self, btf, name, kind_flag):
+        self.btf = btf
+        self.name = name
+        self.kind_flag = kind_flag
+
+    def __str__(self):
+        if self.kind_flag:
+            return "union %s" % self.name
+        else:
+            return "struct %s" % self.name
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        return cls(btf, name, kind_flag)
+
+class FuncProto(BTFType):
+    KIND = BTF.KIND_FUNC_PROTO
+    def __init__(self, btf, name, vlen, type):
+        self.btf = btf
+        self.name = name
+        self.vlen = vlen
+        self.type = type
+
+    def __str__(self):
+        return "%s (*%s)(...)" % str(self.ref, self.name)
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        btf.eat(vlen * 8)
+        return cls(btf, name, vlen, type)
+
+    @property
+    def size(self):
+        return self.btf.arch_size
+
+    class Value(BaseValue):
+        def __int__(self):
+            return struct.unpack('P', self.data)[0]
+
+        def to_str(self, indent):
+            return '0x%x' % int(self)
+
+class Func(Ref):
+    KIND = BTF.KIND_FUNC
+
+class Var(BTFType):
+    KIND = BTF.KIND_VAR
+
+    def __init__(self, btf, name, type):
+        self.btf = btf
+        self.name = name
+        self.type = type
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        btf.eat(4)
+        return cls(btf, name, type)
+
+class DataSec(BTFType):
+    KIND = BTF.KIND_DATASEC
+
+    def __init__(self, btf, name, vlen, size):
+        self.btf = btf
+        self.vlen = vlen
+        self.size = size
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        btf.eat(12 * vlen)
+        return cls(btf, name, vlen, size)
 
 def get_symbol_addr(name):
     output = subprocess.check_output(
@@ -464,26 +1165,25 @@ class KernelMem(object):
             })
 
             if verbose:
-                print(
-                    "     0x%x ~ 0x%x @ 0x%x" % (
+                print("     0x%x ~ 0x%x @ 0x%x" % (
                         self.segs[-1]['vma'],
                         self.segs[-1]['vma'] + self.segs[-1]['len'],
                         self.segs[-1]['off']),
                         file=sys.stderr)
 
-    def read(self, addr, len):
+    def read(self, addr, size):
         off = None
         for s in self.segs:
-            if addr >= s['vma'] and (addr + len) <= s['vma'] + s['len']:
+            if addr >= s['vma'] and (addr + size) <= s['vma'] + s['len']:
                 off = s['off'] + (addr - s['vma'])
                 break
 
         if not off:
             raise Exception(
-                "invalid virtual address 0x%x~0x%x" % (addr, addr + len))
+                "invalid virtual address 0x%x~0x%x" % (addr, addr + size))
 
         self.kcore.seek(off)
-        return self.kcore.read(len)
+        return self.kcore.read(size)
 
 class Token(object):
     pass
@@ -544,9 +1244,12 @@ class Rsquare(Token):
         return ']'
 
 
-class Struct(Token):
-    def __str__(self):
-        return 'struct'
+class Keyword(Token):
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self, ):
+        return self.value
 
 
 class Lexer(object):
@@ -613,7 +1316,7 @@ class Lexer(object):
                 symbol_str += self.text[self.pos]
                 self.pos += 1
             if symbol_str == 'struct':
-                return Struct()
+                return Keyword(symbol_str)
             else:
                 return Symbol(symbol_str)
         else:
@@ -693,28 +1396,28 @@ class Typecast(AST):
         ret += ''.join(['[%d]' % i for i in self.indexes])
         return ret.strip()
 
-    def btf_type(self, btf):
-        if self.keyword == 'struct':
-            try:
-                type = btf.get_type(btf.BTF_KIND_STRUCT, self.new_type)
-            except KeyError:
-                raise Exception("can't find struct '%s'" % self.new_type)
-        else:
-            try:
-                type = btf.get_type(btf.BTF_KIND_INT, self.new_type)
-            except KeyError:
-                try:
-                    type = btf.get_type(btf.BTF_KIND_TYPEDEF, self.new_type)
-                except KeyError:
-                    raise Exception("can't find symbol '%s'" % self.new_type)
+    # def btf_type(self, btf):
+    #     if self.keyword == 'struct':
+    #         try:
+    #             type = btf.get_type(btf.KIND_STRUCT, self.new_type)
+    #         except KeyError:
+    #             raise Exception("can't find struct '%s'" % self.new_type)
+    #     else:
+    #         try:
+    #             type = btf.get_type(btf.KIND_INT, self.new_type)
+    #         except KeyError:
+    #             try:
+    #                 type = btf.get_type(btf.KIND_TYPEDEF, self.new_type)
+    #             except KeyError:
+    #                 raise Exception("can't find symbol '%s'" % self.new_type)
 
-        for idx in self.indexes:
-            type = {'kind': btf.BTF_KIND_ARRAY, 'nelems': idx, 'type_obj': type}
+    #     for idx in self.indexes:
+    #         type = {'kind': btf.KIND_ARRAY, 'nelems': idx, 'type_obj': type}
 
-        for i in range(self.ref_level):
-            type = {'kind': btf.BTF_KIND_PTR, 'type_obj': type}
+    #     for i in range(self.ref_level):
+    #         type = {'kind': btf.KIND_PTR, 'type_obj': type}
 
-        return type
+    #     return type
 
     def __str__(self):
         return '((%s)%s)' % (self.type_str, self.variable)
@@ -756,7 +1459,7 @@ class Parser(object):
                 ref_level = 0
                 self.lexer.next_token_expect(Lparen)
                 token = self.lexer.next_token()
-                if isinstance(token, Struct):
+                if isinstance(token, Keyword):
                     keyword = str(token)
                     symbol = self.lexer.next_token_expect(Symbol)
                 elif isinstance(token, Symbol):
@@ -842,27 +1545,27 @@ class Dumper(object):
         self.string_max_force = string_max_force
         self.hex_string = hex_string
         self.kernel_mem = KernelMem()
-        self.btf = BTF(btf_path)
+        self.btf = BTF(btf_path, mem_reader=self.kernel_mem)
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
-    @log_arg_ret
-    def get_member_offset_and_type(self, type_info, member):
-        # TODO delete
-        # import pdb
-        # pdb.set_trace()
-        try:
-            for m in type_info['members']:
-                if m['name'] == str(member):
-                    # TODO bitfield
-                    return int(m['offset']/8), m['type_obj']
-        except Exception as e:
-            append_err_txt(e, "failed to get offset(%s, %s): " %
-                           (type_info, member))
-            reraise()
+    # @log_arg_ret
+    # def get_member_offset_and_type(self, type_info, member):
+    #     # TODO delete
+    #     # import pdb
+    #     # pdb.set_trace()
+    #     try:
+    #         for m in type_info['members']:
+    #             if m['name'] == str(member):
+    #                 # TODO bitfield
+    #                 return int(m['offset']/8), m['type_obj']
+    #     except Exception as e:
+    #         append_err_txt(e, "failed to get offset(%s, %s): " %
+    #                        (type_info, member))
+    #         reraise(*sys.exc_info())
 
-        raise Exception("type '%s' has no member '%s'" % (type_info['name'], member))
+    #     raise Exception("type '%s' has no member '%s'" % (type_info['name'], member))
 
     @log_arg_ret
     def get_symbol_address_and_type(self, symbol_str):
@@ -871,7 +1574,7 @@ class Dumper(object):
         except Exception as e:
             append_err_txt(e, "failed to get address of symbol '%s': " %
                            symbol_str)
-            reraise()
+            reraise(*sys.exc_info())
 
     @log_arg_ret
     def dereference_addr(self, address):
@@ -882,21 +1585,47 @@ class Dumper(object):
 
         return struct.unpack('P', data)[0]
 
-    def simplify_type(self, type_info):
-        if type_info['kind'] in {
-            self.btf.BTF_KIND_TYPEDEF,
-            self.btf.BTF_KIND_VOLATILE,
-            self.btf.BTF_KIND_CONST,
-            self.btf.BTF_KIND_RESTRICT
-            }:
-            return self.simplify_type(type_info['type_obj'])
-        return type_info
+    # def simplify_type(self, type_info):
+    #     if type_info['kind'] in {
+    #         self.btf.KIND_TYPEDEF,
+    #         self.btf.KIND_VOLATILE,
+    #         self.btf.KIND_CONST,
+    #         self.btf.KIND_RESTRICT
+    #         }:
+    #         return self.simplify_type(type_info['type_obj'])
+    #     return type_info
+
+    def get_btf_type(self, typecast):
+        if typecast.keyword == 'struct':
+            try:
+                type = self.btf.get_type(BTF.KIND_STRUCT, typecast.new_type)
+            except KeyError:
+                raise Exception("can't find struct '%s'" % typecast.new_type)
+        else:
+            try:
+                type = self.btf.get_type(BTF.KIND_INT, typecast.new_type)
+            except KeyError:
+                try:
+                    type = self.btf.get_type(BTF.KIND_TYPEDEF, typecast.new_type)
+                except KeyError:
+                    raise Exception("can't find symbol '%s'" % typecast.new_type)
+
+        for idx in typecast.indexes:
+            type = Array(self.btf, '', type, idx)
+            # type = {'kind': BTF.KIND_ARRAY, 'nelems': idx, 'type_obj': type}
+
+        for i in range(typecast.ref_level):
+            type = Ptr(self.btf, '', type)
+            # type = {'kind': BTF.KIND_PTR, 'type_obj': type}
+
+        return type
 
     @log_arg_ret
     def get_addr_and_type(self, expr):
         if isinstance(expr, Typecast):
             addr, _ = self.get_addr_and_type(expr.variable)
-            return addr, self.simplify_type(expr.btf_type(self.btf))
+            return addr, self.get_btf_type(expr)
+            # return addr, self.simplify_type(expr.btf_type(self.btf))
 
         elif isinstance(expr, Access):
             addr, type_info = self.get_addr_and_type(expr.variable)
@@ -904,63 +1633,76 @@ class Dumper(object):
                 raise Exception("type of '%s' is not specified" %
                                 expr.variable)
 
-            if type_info['kind'] not in {
-                self.btf.BTF_KIND_STRUCT, self.btf.BTF_KIND_UNION}:
+            if not type_info.is_kind(BTF.KIND_STRUCT) and \
+                not type_info.is_kind(BTF.KIND_UNION):
                 raise Exception("type of '%s' is '%s', neither struct nor union, "
                                 "'.' is not allowed" %
                                 (expr.variable, type_info))
 
-            offset, type_info = self.get_member_offset_and_type(
-                type_info, expr.member)
-            return addr + offset, self.simplify_type(type_info)
+            member = type_info.get(expr.member)
+            return addr + (member.offset), member.ref
+            # offset, type_info = self.get_member_offset_and_type(
+            #     type_info, expr.member)
+            # return addr + offset, self.simplify_type(type_info)
 
         elif isinstance(expr, Dereference):
             addr, type_info = self.get_addr_and_type(expr.variable)
             if not type_info:
                 raise Exception("type of '%s' is not specified" %
                                 expr.variable)
-            if type_info['kind'] == self.btf.BTF_KIND_ARRAY:
+            if type_info.is_kind(BTF.KIND_ARRAY):
                 raise Exception("type of '%s' is '%s', which is an array, "
                                 "not a pointer, '%s' is not allowed" %
                                 (expr.variable, type_info,
                                  '->' if expr.member else '*'))
-            if type_info['kind'] != self.btf.BTF_KIND_PTR:
+            if type_info.is_kind(BTF.KIND_STRUCT) or type_info.is_kind(BTF.KIND_UNION):
                 if expr.member:
                     raise Exception("type of '%s' is '%s', '.' "
                                     "should be used instead of '->'" %
                                     (expr.variable, type_info))
-                else:
-                    raise Exception("type of '%s' is '%s', not a pointer, "
-                                    "'*' is not allowed" %
-                                    (expr.variable, type_info))
-            type_info = self.btf.dereference_type(type_info)
-            type_info = self.simplify_type(type_info)
+            if not type_info.is_kind(BTF.KIND_PTR):
+                raise Exception("type of '%s' is '%s', not a pointer, "
+                                "'%s' is not allowed" %
+                                (expr.variable, type_info,
+                                '->' if expr.member else '*'))
+            # type_info = self.btf.dereference_type(type_info)
+            # type_info = self.simplify_type(type_info)
+            type_info = type_info.ref
             addr = self.dereference_addr(addr)
             offset = 0
             if expr.member:
-                offset, type_info = self.get_member_offset_and_type(
-                    type_info, expr.member)
-            return addr + offset, self.simplify_type(type_info)
+                if not type_info.is_kind(BTF.KIND_STRUCT) and \
+                    not type_info.is_kind(BTF.KIND_UNION):
+                    raise Exception("type of '*%s' is '%s', neither struct nor union, "
+                                    "'->' is not allowed" %
+                                    (expr.variable, type_info))
+                type_info = type_info.get(expr.member)
+                offset = type_info.offset
+                type_info = type_info.ref
+            return addr + offset, type_info
+            # return addr + offset, self.simplify_type(type_info)
 
         elif isinstance(expr, Index):
             addr, type_info = self.get_addr_and_type(expr.variable)
             if not type_info:
                 raise Exception("type of '%s' is not specified" %
                                 expr.variable)
-            if type_info['kind'] not in {
-                self.btf.BTF_KIND_ARRAY, self.btf.BTF_KIND_PTR}:
+            if not type_info.is_kind(BTF.KIND_ARRAY) and \
+                not type_info.is_kind(BTF.KIND_PTR):
                 raise Exception("type of '%s' is '%s', neither pointer "
                                 "nor array, index is not allowed" %
                                 (expr.variable, type_info))
 
-            type_info = self.btf.dereference_type(type_info)
-            type_info = self.simplify_type(type_info)
-            if type_info['kind'] == self.btf.BTF_KIND_PTR:
+            # type_info = self.btf.dereference_type(type_info)
+            # type_info = self.simplify_type(type_info)
+            type_info = type_info.ref
+            if type_info.is_kind(BTF.KIND_PTR):
                 # index a pointer instead of array
                 addr = self.dereference_addr(addr)
 
-            type_size = self.btf.get_type_size(type_info)
-            return addr + type_size * expr.index, self.simplify_type(type_info)
+            # type_size = self.btf.get_type_size(type_info)
+            # return addr + type_size * expr.index, self.simplify_type(type_info)
+            return addr + type_info.size * expr.index, type_info
 
         elif isinstance(expr, Symbol):
             return self.get_symbol_address_and_type(expr.value)
@@ -970,165 +1712,172 @@ class Dumper(object):
         
         raise Exception("unsupported expression: %s" % expr)
 
-    def dump_byte_array(self, data, array_len, indent):
-        omit_tip = ''
-        if (indent > 0 or self.string_max_force) and \
-                array_len > self.string_max:
-            data = data[:self.string_max]
-            omit_tip = '...'
+    # def dump_byte_array(self, data, array_len, indent):
+    #     omit_tip = ''
+    #     if (indent > 0 or self.string_max_force) and \
+    #             array_len > self.string_max:
+    #         data = data[:self.string_max]
+    #         omit_tip = '...'
 
-        if not self.hex_string:
-            try:
-                # dump as string if there is no unprintable character
-                str_val = data.decode('ascii')
-                end = str_val.find('\x00')
-                if end >= 0:
-                    str_val = str_val[:end]
-                if not re.search(r'[^\t-\r\x20-\x7e]', str_val):
-                    return '"%s"' % (str_val + (omit_tip if end < 0 else ''))
-            except Exception:
-                pass
+    #     if not self.hex_string:
+    #         try:
+    #             # dump as string if there is no unprintable character
+    #             str_val = data.decode('ascii')
+    #             end = str_val.find('\x00')
+    #             if end >= 0:
+    #                 str_val = str_val[:end]
+    #             if not re.search(r'[^\t-\r\x20-\x7e]', str_val):
+    #                 return '"%s"' % (str_val + (omit_tip if end < 0 else ''))
+    #         except Exception:
+    #             pass
 
-        # dump as hex
-        return '"<binary>" /* hex: %s */' % \
-               (codecs.encode(data, 'hex').decode() + omit_tip)
+    #     # dump as hex
+    #     return '"<binary>" /* hex: %s */' % \
+    #            (codecs.encode(data, 'hex').decode() + omit_tip)
 
-    def dump_array(self, data, element_type, array_len, indent):
-        element_type = self.simplify_type(element_type)
-        type_size = self.btf.get_type_size(element_type)
-        omit_count = 0
-        # if type_size == 1:
-        if element_type['kind'] == self.btf.BTF_KIND_INT and \
-                element_type['size'] == 1:
-            return self.dump_byte_array(data, array_len, indent)
+    # def dump_array(self, data, element_type, array_len, indent):
+    #     element_type = self.simplify_type(element_type)
+    #     type_size = self.btf.get_type_size(element_type)
+    #     omit_count = 0
+    #     # if type_size == 1:
+    #     if element_type['kind'] == self.btf.KIND_INT and \
+    #             element_type['size'] == 1:
+    #         return self.dump_byte_array(data, array_len, indent)
 
-        # dump array in each line
-        if (indent > 0 or self.array_max_force) and array_len > self.array_max:
-            omit_count = array_len - self.array_max
-            array_len = self.array_max
+    #     # dump array in each line
+    #     if (indent > 0 or self.array_max_force) and array_len > self.array_max:
+    #         omit_count = array_len - self.array_max
+    #         array_len = self.array_max
 
-        indent += 1
-        if element_type['kind'] == self.btf.BTF_KIND_INT:
-            dump_txt = '{'
-            sep = ' '
-            before = ''
-        else:
-            dump_txt = '{\n'
-            sep = '\n'
-            before = indent * self.BLANK
+    #     indent += 1
+    #     if element_type['kind'] == self.btf.KIND_INT:
+    #         dump_txt = '{'
+    #         sep = ' '
+    #         before = ''
+    #     else:
+    #         dump_txt = '{\n'
+    #         sep = '\n'
+    #         before = indent * self.BLANK
 
-        for i in range(array_len):
-            dump_txt += before + self.dump_type(
-                data[type_size * i: type_size * i + type_size],
-                element_type, indent) + ',' + sep
+    #     for i in range(array_len):
+    #         dump_txt += before + self.dump_type(
+    #             data[type_size * i: type_size * i + type_size],
+    #             element_type, indent) + ',' + sep
 
-        if omit_count:
-            dump_txt += before + '/* other %s elements are omitted */%s' % (
-                            omit_count, sep)
-        indent -= 1
-        if sep == '\n':
-            dump_txt += indent * self.BLANK + '}'
-        else:
-            dump_txt += '}'
-        return dump_txt
+    #     if omit_count:
+    #         dump_txt += before + '/* other %s elements are omitted */%s' % (
+    #                         omit_count, sep)
+    #     indent -= 1
+    #     if sep == '\n':
+    #         dump_txt += indent * self.BLANK + '}'
+    #     else:
+    #         dump_txt += '}'
+    #     return dump_txt
 
-    def dump_basic_type(self, data, type_info):
-        if type_info['size'] == 1:
-            if type_info.get('bool', False):
-                return 'true' if struct.unpack('B', data)[0] else 'false'
-            elif type_info.get('signed', False):
-                val = struct.unpack('b', data)[0]
-            else:
-                val = struct.unpack('B', data)[0]
+    # def dump_basic_type(self, data, type_info):
+    #     if type_info['size'] == 1:
+    #         if type_info.get('bool', False):
+    #             return 'true' if struct.unpack('B', data)[0] else 'false'
+    #         elif type_info.get('signed', False):
+    #             val = struct.unpack('b', data)[0]
+    #         else:
+    #             val = struct.unpack('B', data)[0]
 
-        elif type_info['size'] == 2:
-            if type_info.get('signed', False):
-                val = struct.unpack('h', data)[0]
-            else:
-                val = struct.unpack('H', data)[0]
+    #     elif type_info['size'] == 2:
+    #         if type_info.get('signed', False):
+    #             val = struct.unpack('h', data)[0]
+    #         else:
+    #             val = struct.unpack('H', data)[0]
 
-        elif type_info['size'] == 4:
-            if type_info.get('signed', False):
-                val = struct.unpack('i', data)[0]
-            else:
-                val = struct.unpack('I', data)[0]
+    #     elif type_info['size'] == 4:
+    #         if type_info.get('signed', False):
+    #             val = struct.unpack('i', data)[0]
+    #         else:
+    #             val = struct.unpack('I', data)[0]
 
-        elif type_info['size'] == 8:
-            if type_info.get('signed', False):
-                val = struct.unpack('l', data)[0]
-            else:
-                val = struct.unpack('L', data)[0]
+    #     elif type_info['size'] == 8:
+    #         if type_info.get('signed', False):
+    #             val = struct.unpack('l', data)[0]
+    #         else:
+    #             val = struct.unpack('L', data)[0]
 
-        else:
-            return "ERROR /* invalid int size: %d */" % type_info['size']
+    #     else:
+    #         return "ERROR /* invalid int size: %d */" % type_info['size']
 
-        # TODO bitfield
-        return str(val)
+    #     # TODO bitfield
+    #     return str(val)
 
-    def dump_struct(self, data, type_info, indent):
-        dump_txt = '{\n'
-        indent += 1
-        for m in type_info['members']:
-            m_name = m['name']
-            try:
-                m_off, m_type = self.get_member_offset_and_type(type_info, m_name)
-                m_size = self.btf.get_type_size(m_type)
-                if m_name:
-                    dump_txt += indent * self.BLANK + '.' + m_name + ' = '
-                elif m_type['kind'] == self.btf.BTF_KIND_STRUCT:
-                    dump_txt += indent * self.BLANK + '/* nested anonymous struct */ '
-                else:
-                    dump_txt += indent * self.BLANK + '/* nested anonymous union */ '
-                dump_txt += self.dump_type(data[m_off: m_off + m_size], m_type, indent)
-                dump_txt += ',\n'
-            except Exception:
-                dump_txt += \
-                    indent * self.BLANK + \
-                    "// parse member '%s' of type '%s' failed\n" % \
-                    (m_name, type_info['name'])
-                log_exception()
+    # def dump_struct(self, data, type_info, indent):
+    #     dump_txt = '{\n'
+    #     indent += 1
+    #     for m in type_info['members']:
+    #         m_name = m['name']
+    #         try:
+    #             m_off, m_type = self.get_member_offset_and_type(type_info, m_name)
+    #             m_size = self.btf.get_type_size(m_type)
+    #             if m_name:
+    #                 dump_txt += indent * self.BLANK + '.' + m_name + ' = '
+    #             elif m_type['kind'] == self.btf.KIND_STRUCT:
+    #                 dump_txt += indent * self.BLANK + '/* nested anonymous struct */ '
+    #             else:
+    #                 dump_txt += indent * self.BLANK + '/* nested anonymous union */ '
+    #             dump_txt += self.dump_type(data[m_off: m_off + m_size], m_type, indent)
+    #             dump_txt += ',\n'
+    #         except Exception:
+    #             dump_txt += \
+    #                 indent * self.BLANK + \
+    #                 "// parse member '%s' of type '%s' failed\n" % \
+    #                 (m_name, type_info['name'])
+    #             log_exception()
 
-        indent -= 1
-        dump_txt += indent * self.BLANK + '}'
-        return dump_txt
+    #     indent -= 1
+    #     dump_txt += indent * self.BLANK + '}'
+    #     return dump_txt
 
-    def dump_type(self, data, type_info, indent=0):
-        type_info = self.simplify_type(type_info)
-        if type_info['kind'] in {
-            self.btf.BTF_KIND_PTR, self.btf.BTF_KIND_FUNC_PROTO}:
-            # dump pointer
-            return '0x%x' % struct.unpack('P', data[:self.arch_size])[0]
+    # def dump_type(self, data, type_info, indent=0):
+    #     type_info = self.simplify_type(type_info)
+    #     if type_info['kind'] in {
+    #         self.btf.KIND_PTR, self.btf.KIND_FUNC_PROTO}:
+    #         # dump pointer
+    #         return '0x%x' % struct.unpack('P', data[:self.arch_size])[0]
 
-        if type_info['kind'] == self.btf.BTF_KIND_ARRAY:
-            return self.dump_array(
-                data, type_info['type_obj'], type_info['nelems'], indent)
+    #     if type_info['kind'] == self.btf.KIND_ARRAY:
+    #         return self.dump_array(
+    #             data, type_info['type_obj'], type_info['nelems'], indent)
 
-        if type_info['kind'] in {self.btf.BTF_KIND_INT, self.btf.BTF_KIND_ENUM}:
-            return self.dump_basic_type(data, type_info)
+    #     if type_info['kind'] in {self.btf.KIND_INT, self.btf.KIND_ENUM}:
+    #         return self.dump_basic_type(data, type_info)
 
-        # dump struct
-        if type_info['kind'] in {self.btf.BTF_KIND_STRUCT, self.btf.BTF_KIND_UNION}:
-            return self.dump_struct(data, type_info, indent)
+    #     # dump struct
+    #     if type_info['kind'] in {self.btf.KIND_STRUCT, self.btf.KIND_UNION}:
+    #         return self.dump_struct(data, type_info, indent)
 
-        return "ERROR /* unsupported type: '%d-%s' */" % \
-            (type_info['kind'], type_info['name'])
+    #     return "ERROR /* unsupported type: '%d-%s' */" % \
+    #         (type_info['kind'], type_info['name'])
 
-    def get_data_and_type(self, expr):
-        addr, type_info = self.get_addr_and_type(expr)
-        if not type_info:
+    # def get_data_and_type(self, expr):
+    #     addr, type_info = self.get_addr_and_type(expr)
+    #     if not type_info:
+    #         raise Exception("type of '%s' is not specified" % expr)
+
+    #     type_size = self.btf.get_type_size(type_info)
+    #     try:
+    #         data = self.kernel_mem.read(addr, type_size)
+    #     except Exception as e:
+    #         append_err_txt(e, "read memory failed: ")
+    #         reraise(*sys.exc_info())
+    #     return data, type_info
+
+    def get_value(self, expr):
+        addr, type = self.get_addr_and_type(expr)
+        if not type:
             raise Exception("type of '%s' is not specified" % expr)
 
-        type_size = self.btf.get_type_size(type_info)
-        try:
-            data = self.kernel_mem.read(addr, type_size)
-        except Exception as e:
-            append_err_txt(e, "read memory failed: ")
-            reraise()
-        return data, type_info
+        return type(addr=addr)
 
     def dump(self, expr):
-        data, type_info = self.get_data_and_type(expr)
-        return "%s = %s;" % (expr, self.dump_type(data, type_info, indent=0))
+        value = self.get_value(expr)
+        return "%s = %s;" % (expr, str(value))
 
 
 def do_dump(dumper, expression_list, watch_interval=None):
@@ -1144,21 +1893,23 @@ def do_dump(dumper, expression_list, watch_interval=None):
             expr_list.append(info)
         except Exception as e:
             append_err_txt(e, "parse '%s' failed: " % expression)
-            reraise()
+            reraise(*sys.exc_info())
 
     while True:
         txt = ''
         for info in expr_list:
             try:
-                data, type_info = dumper.get_data_and_type(info['expr'])
-                if data != info['last_data']:
-                    txt += ("%s = %s;\n" %
-                          (info['expr'], dumper.dump_type(data, type_info)))
-                    info['last_data'] = data
+                value = dumper.get_value(info['expr'])
+                # import pdb
+                # pdb.set_trace()
+                # data, type_info = dumper.get_data_and_type(info['expr'])
+                if value.data != info['last_data']:
+                    txt += ("%s = %s;\n" % (info['expr'], str(value)))
+                    info['last_data'] = value.data
             except Exception as e:
                 if len(expression_list) == 1 and watch_interval is None:
                     append_err_txt(e, "dump '%s' failed: " % info['expr'])
-                    reraise()
+                    reraise(*sys.exc_info())
                 else:
                     log_exception()
 
@@ -1182,26 +1933,26 @@ def do_dump(dumper, expression_list, watch_interval=None):
         time.sleep(watch_interval)
 
 
-def show_netdev():
-    dumper = Dumper()
-    expr = Parser(Lexer('((struct net) init_net).dev_base_head.next')).parse()
-    data, type = dumper.get_data_and_type(expr)
-    next_type = type
-    next = int(dumper.dump_type(data, type), base=0)
+# def show_netdev():
+#     dumper = Dumper()
+#     expr = Parser(Lexer('((struct net) init_net).dev_base_head.next')).parse()
+#     value = dumper.get_value(expr)
+#     next_type = type
+#     next = int(value)
 
-    netdev_type = dumper.btf.get_type(BTF.BTF_KIND_STRUCT, "net_device")
-    offset = dumper.get_member_offset_and_type(netdev_type, 'dev_list')[0]
+#     netdev_type = dumper.btf.get_type(BTF.KIND_STRUCT, "net_device")
+#     offset = dumper.get_member_offset_and_type(netdev_type, 'dev_list')[0]
 
-    while next:
-        dev_addr = next - offset
-        expr = Parser(Lexer('((struct net_device) %d).name' % dev_addr)).parse()
-        data, type = dumper.get_data_and_type(expr)
-        dev_name = dumper.dump_type(data, type)
-        print("%s 0x%x" % (dev_name, dev_addr))
+#     while next:
+#         dev_addr = next - offset
+#         expr = Parser(Lexer('((struct net_device) %d).name' % dev_addr)).parse()
+#         data, type = dumper.get_data_and_type(expr)
+#         dev_name = dumper.dump_type(data, type)
+#         print("%s 0x%x" % (dev_name, dev_addr))
 
-        expr = Parser(Lexer('((struct list_head) %d).prev' % next)).parse()
-        data, type = dumper.get_data_and_type(expr)
-        next = int(dumper.dump_type(data, type), base=0)
+#         expr = Parser(Lexer('((struct list_head) %d).prev' % next)).parse()
+#         data, type = dumper.get_data_and_type(expr)
+#         next = int(dumper.dump_type(data, type), base=0)
 
 if __name__ == '__main__':
     epilog = """examples:
@@ -1240,9 +1991,13 @@ if __name__ == '__main__':
         dumper = Dumper(array_max=array_max, array_max_force=array_max_force,
                         hex_string=args.hex_string, string_max=string_max,
                         string_max_force=string_max_force, btf_path=args.btf)
+        # try:
         do_dump(dumper, args.expression, args.watch_interval)
+        # except Exception:
+        #     import pdb
+        #     pdb.set_trace()
     except Exception as e:
         print("Error: %s" % get_err_txt(e), file=sys.stderr)
         if verbose:
-            reraise()
+            reraise(*sys.exc_info())
         exit(1)
