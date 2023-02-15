@@ -156,6 +156,7 @@ class FormatOpt(object):
         self.blank = blank
 
 class BTF(object):
+    KIND_VOID = 0
     KIND_INT = 1
     KIND_PTR = 2
     KIND_ARRAY = 3
@@ -412,6 +413,16 @@ class BTFType(object):
     def is_kind(self, kind):
         return self.KIND == kind
 
+@BTF.register_type(BTF.KIND_VOID)
+class Int(BTFType):
+    def __init__(self, btf, name):
+        self.btf = btf
+        self.name = name
+
+    @classmethod
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+        return cls(btf, name)
+
 @BTF.register_type(BTF.KIND_INT)
 class Int(BTFType):
     def __init__(self, btf, name, size, signed=False, char=False,
@@ -492,7 +503,7 @@ class Ptr(Ref):
         def __int__(self):
             return struct.unpack('P', self.data)[0]
 
-        def to_str(self, indent):
+        def to_str(self, indent=0):
             return '0x%x' % int(self)
 
         def __getitem__(self, idx):
@@ -500,10 +511,10 @@ class Ptr(Ref):
             return self.type.ref(addr=addr)
 
         def __getattr__(self, name):
-            return getattr(self.eval(), name)
+            return getattr(self.value, name)
 
         @property
-        def eval(self):
+        def value(self):
             try:
                 return self.type.ref(addr=int(self))
             except AttributeError:
@@ -609,6 +620,7 @@ class Array(BTFType):
 
         def dump_byte_array(self, indent):
             omit_tip = ''
+            data = self.data
             if (indent > 0 or self.fmt.string_max_force) and \
                     self.type.nelems > self.fmt.string_max:
                 data = self.data[:self.fmt.string_max]
@@ -630,7 +642,7 @@ class Array(BTFType):
             return '"<binary>" /* hex: %s */' % \
                 (codecs.encode(data, 'hex').decode() + omit_tip)
 
-        def to_str(self, indent):
+        def to_str(self, indent=0):
             elem_type = self.type.ref
             elem_size = elem_type.size
             array_len = self.type.nelems
@@ -742,7 +754,6 @@ class StructUnion(BTFType):
             return self._get(member)
 
         def __getattr__(self, name):
-            print("call __getattr__")
             return self.get(name)
 
         def _get(self, member):
@@ -829,7 +840,7 @@ class Enum(Int):
             if val in self.type.value_map:
                 return self.type.value_map[val].name
 
-            return super().to_str(indent)
+            return super(self.__class__, self).to_str(indent)
 
 @BTF.register_type(BTF.KIND_FWD)
 class Fwd(BTFType):
@@ -872,7 +883,7 @@ class FuncProto(BTFType):
         def __int__(self):
             return struct.unpack('P', self.data)[0]
 
-        def to_str(self, indent):
+        def to_str(self, indent=0):
             return '0x%x' % int(self)
 
 @BTF.register_type(BTF.KIND_FUNC)
@@ -903,16 +914,6 @@ class DataSec(BTFType):
     def from_btf(cls, btf, name, size, type, vlen, kind_flag):
         btf.eat(12 * vlen)
         return cls(btf, name, vlen, size)
-
-def get_symbol_addr(name):
-    try:
-        output = subprocess.check_output(
-            "cat /proc/kallsyms | grep -w %s | awk '{print $1}'" % name,
-            shell=True).decode()
-        return int('0x' + output, base=0)
-    except Exception as e:
-        append_err_txt(e, "failed to get address of symbol '%s': " % name)
-        reraise(*sys.exc_info())
 
 class KernelMem(object):
     def __init__(self):
@@ -1281,30 +1282,31 @@ class Parser(object):
 class Dumper(object):
     BLANK = '    '
 
-    def __init__(self, fmt=FormatOpt(),
+    def __init__(self, fmt=FormatOpt(), mem_reader=KernelMem(),
                  btf_path=DEFAULT_BTF_PATH, cache_dir=DEFAULT_CACHE_DIR):
-        self.kernel_mem = KernelMem()
+        self.mem_reader = mem_reader
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
         path_list = btf_path if isinstance(btf_path, list) else [btf_path]
-        self.btfs = [BTF(path, mem_reader=self.kernel_mem,
+        self.btfs = [BTF(path, mem_reader=mem_reader,
                          fmt=fmt, cache_dir=cache_dir) for path in path_list]
-        # self.btf = BTF(btf_path, mem_reader=self.kernel_mem,
-        #         fmt=fmt, cache_dir=cache_dir)
 
     @log_arg_ret
     def dereference_addr(self, address):
         try:
-            data = self.kernel_mem.read(address, self.arch_size)
+            data = self.mem_reader.read(address, self.arch_size)
         except Exception:
             raise Exception("read at address 0x%x failed" % address)
 
         return struct.unpack('P', data)[0]
 
-    def get_btf_type(self, typecast):
+    def get_type(self, typecast):
         type = None
+        if isinstance(typecast, str):
+            typecast = Parser(Lexer('(%s)a' % typecast)).parse()
+
         for btf in self.btfs:
             if typecast.keyword == 'struct':
                 try:
@@ -1323,7 +1325,7 @@ class Dumper(object):
 
         if not type:
             raise Exception(
-                "can't find symbol %s%s" % (typecast.keyword, typecast.new_type))
+                "can't find type %s %s" % (typecast.keyword, typecast.new_type))
 
         for idx in typecast.indexes:
             type = Array(type.btf, '', type, idx)
@@ -1333,11 +1335,22 @@ class Dumper(object):
 
         return type
 
+    @staticmethod
+    def get_symbol_addr(name):
+        try:
+            output = subprocess.check_output(
+                "cat /proc/kallsyms | grep -w %s | awk '{print $1}'" % name,
+                shell=True).decode()
+            return int('0x' + output, base=0)
+        except Exception as e:
+            append_err_txt(e, "failed to get address of symbol '%s': " % name)
+            reraise(*sys.exc_info())
+
     @log_arg_ret
     def get_addr_type(self, expr):
         if isinstance(expr, Typecast):
             addr, _ = self.get_addr_type(expr.variable)
-            return addr, self.get_btf_type(expr)
+            return addr, self.get_type(expr)
 
         elif isinstance(expr, Access):
             addr, type = self.get_addr_type(expr.variable)
@@ -1404,14 +1417,17 @@ class Dumper(object):
             return addr + type.size * expr.index, type
 
         elif isinstance(expr, Symbol):
-            return get_symbol_addr(expr.value), None
+            return self.get_symbol_addr(expr.value), None
 
         elif isinstance(expr, Number):
             return expr.value, None
 
         raise Exception("unsupported expression: %s" % expr)
 
-    def get_value(self, expr):
+    def eval(self, expr):
+        if isinstance(expr, str):
+            expr = Parser(Lexer(expr)).parse()
+
         addr, type = self.get_addr_type(expr)
         if not type:
             raise Exception("type of '%s' is not specified" % expr)
@@ -1419,7 +1435,7 @@ class Dumper(object):
         return type(addr=addr)
 
     def dump(self, expr):
-        value = self.get_value(expr)
+        value = self.eval(expr)
         return "%s = %s;" % (expr, str(value))
 
 
@@ -1442,7 +1458,7 @@ def do_dump(dumper, expression_list, watch_interval=None):
         txt = ''
         for info in expr_list:
             try:
-                value = dumper.get_value(info['expr'])
+                value = dumper.eval(info['expr'])
                 if value.data != info['last_data']:
                     txt += ("%s = %s;\n" % (info['expr'], str(value)))
                     info['last_data'] = value.data
@@ -1472,11 +1488,19 @@ def do_dump(dumper, expression_list, watch_interval=None):
         sys.stdout.flush()
         time.sleep(watch_interval)
 
+def show_netdev(dumper):
+    dev_type = dumper.get_type('struct net_device')
+    dev_head = dumper.eval('((struct net) init_net).dev_base_head')
+    next = dev_head.next
+    while int(next) != dev_head.addr:
+        dev = dev_type(addr=(int(next) - dev_type.dev_list.offset))
+        print("%s @ 0x%x" % (dev.name, dev.addr))
+        next = next.next
 
 # def show_netdev():
 #     dumper = Dumper()
 #     expr = Parser(Lexer('((struct net) init_net).dev_base_head.next')).parse()
-#     value = dumper.get_value(expr)
+#     value = dumper.eval(expr)
 #     next_type = type
 #     next = int(value)
 
@@ -1498,14 +1522,18 @@ if __name__ == '__main__':
     epilog = """examples:
     * dump the kernel init_net structure:
         %(prog)s '(struct net) init_net'
-    * 
+    * list net devices:
+        %(prog)s netdev
+    * dump net device at specified address:
+        %(prog)s '(struct net_device)0xffff8d4260214000'
     """ % {'prog': sys.argv[0]}
     parser = argparse.ArgumentParser(
         description='Dump global variables of kernel.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog)
     parser.add_argument('expression', type=str, nargs='+',
-                        help='rvalue expression in C style with typecast')
+                        help='rvalue expression in C style with typecast, ' + 
+                        'or "netdev" to list net devices')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='show debug information')
     parser.add_argument('-x', '--hex-string', action='store_true',
@@ -1537,7 +1565,10 @@ if __name__ == '__main__':
     try:
         dumper = Dumper(btf_path=args.btf_paths.split(','),
                         fmt=fmt, cache_dir=args.cache_dir)
-        do_dump(dumper, args.expression, args.watch_interval)
+        if len(args.expression) == 1 and args.expression[0] in ('netdev', 'net'):
+            show_netdev(dumper)
+        else:
+            do_dump(dumper, args.expression, args.watch_interval)
     except Exception as e:
         print("Error: %s" % get_err_txt(e), file=sys.stderr)
         if verbose:
