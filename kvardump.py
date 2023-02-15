@@ -6,8 +6,9 @@ import re
 import sys
 import time
 import copy
-import pickle
+import json
 import codecs
+import hashlib
 import subprocess
 import argparse
 import platform
@@ -154,47 +155,17 @@ class BTF(object):
     KIND_FUNC_PROTO = 13
     KIND_VAR = 14
     KIND_DATASEC = 15
+    TYPE_MAP = {}
 
-    def __init__(self, path, cache_path='/tmp/kvardump.cache', mem_reader=None,
+    def __init__(self, btf_path, cache_dir='/tmp/kvardump', mem_reader=None,
                  array_max=DEFAULT_ARRAY_MAX, string_max=DEFAULT_STRING_MAX,
                  array_max_force=False, string_max_force=False,
                  hex_string=False, blank='    '):
-        # if os.path.exists('/tmp/kvardump_cache.json'):
-        #     with open('/tmp/kvardump_cache.json', 'r') as f:
-        #         obj = json.load(f)
-        #         self.types = obj['types']
-        #         self.name_map = obj['name_map']
-        #     return
-
-        if cache_path and os.path.exists(cache_path):
-            print("loading types from cache '%s'" % cache_path, file=sys.stderr)
-            with open(cache_path, 'rb') as f:
-                obj = pickle.load(f)
-                self.types = obj.types
-                self.name_map = obj.name_map
-        else:
-            # type ID start from 1
-            self.types = [{}]
-            self.name_map = {}
-
-            print("parsing types from cache '%s'" % path, file=sys.stderr)
-            self.parse(path)
-
-            if cache_path:
-                print("writing types to cache '%s'" % cache_path, file=sys.stderr)
-                # obj = {
-                #     'types': self.types,
-                #     'name_map': self.name_map,
-                # }
-                with open(cache_path, 'wb') as f:
-                    # import pdb
-                    # pdb.set_trace()
-                    pickle.dump(self, f)
-
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
+        self.btf_path = btf_path
         self.mem_reader = mem_reader
         self.array_max = array_max
         self.string_max = string_max
@@ -203,8 +174,104 @@ class BTF(object):
         self.hex_string = hex_string
         self.blank = blank
 
-    def parse(self, path):
-        with open(path, 'rb') as f:
+        self.open_btf()
+
+        cache_path = os.path.join(
+            cache_dir, os.path.basename(btf_path)) if cache_dir else None
+        if cache_path:
+            try:
+                if os.path.exists(cache_path):
+                    self.load_cache(cache_path)
+                    return
+            except Exception as e:
+                print("load cache from %s failed: %s" % (cache_path, e),
+                        file=sys.stderr)
+                log_exception()
+
+        self.parse()
+
+        if cache_path:
+            try:
+                self.save_cache(cache_path)
+            except Exception as e:
+                print("save cache to %s failed: %s" % (cache_path, e),
+                        file=sys.stderr)
+                log_exception()
+        # if os.path.exists('/tmp/kvardump_cache.json'):
+        #     with open('/tmp/kvardump_cache.json', 'r') as f:
+        #         obj = json.load(f)
+        #         self.types = obj['types']
+        #         self.name_map = obj['name_map']
+        #     return
+
+        # if cache_path and os.path.exists(cache_path):
+        #     print("loading types from cache '%s'" % cache_path, file=sys.stderr)
+        #     with open(cache_path, 'rb') as f:
+        #         obj = pickle.load(f)
+        #         self.types = obj.types
+        #         self.name_map = obj.name_map
+        # else:
+        # if True:
+        #     # type ID start from 1
+        #     self.types = [{}]
+        #     self.name_map = {}
+
+        #     print("parsing types from cache '%s'" % btf_path, file=sys.stderr)
+        #     self.parse(btf_path)
+
+        #     # if cache_path:
+        #     #     print("writing types to cache '%s'" % cache_path, file=sys.stderr)
+        #     #     # obj = {
+        #     #     #     'types': self.types,
+        #     #     #     'name_map': self.name_map,
+        #     #     # }
+        #     #     with open(cache_path, 'wb') as f:
+        #     #         # import pdb
+        #     #         # pdb.set_trace()
+        #     #         pickle.dump(self, f)
+
+    def __getitem__(self, kind_name):
+        return self.get(kind_name)
+
+    def __len__(self):
+        return len(self.offsets)
+
+    @classmethod
+    def register_type(cls, kind):
+        def _decorator(target):
+            target.KIND = kind
+            cls.TYPE_MAP[kind] = target
+            return target
+        return _decorator
+
+    def load_cache(self, path):
+        print("loading cache from '%s'" % path, file=sys.stderr)
+
+        with open(path, 'r') as f:
+            cache = json.load(f)
+            if cache['md5'] != self.md5:
+                raise Exception("checksum of '%s' changed" % self.btf_path)
+            self.name2id = cache['name2id']
+            self.offsets = cache['offsets']
+            self.id2type = {}
+
+    def save_cache(self, path):
+        print("writing cache to '%s'" % path, file=sys.stderr)
+
+        dir = os.path.dirname(path)
+        if not os.path.exists(dir):
+            os.mkdir(dir)
+
+        with open(path, 'w') as f:
+            cache = {
+                'name2id': self.name2id,
+                'offsets': self.offsets,
+                'md5': self.md5,
+            }
+            json.dump(cache, f)
+
+    def open_btf(self):
+        with open(self.btf_path, 'rb') as f:
             self.data = f.read()
 
         header = struct.unpack('HBBIIIII', self.data[0:24])
@@ -217,6 +284,7 @@ class BTF(object):
         self.str_off = header[6]
         self.str_len = header[7]
         self.data = self.data[self.hdr_len:]
+        self.md5 = hashlib.md5(self.data).hexdigest()
         self.pos = 0
 
         if (self.type_off + self.type_len > len(self.data)):
@@ -231,43 +299,47 @@ class BTF(object):
         self.str_data = self.data[self.str_off : self.str_off + self.str_len]
         self.type_data = self.data[self.type_off : self.type_off + self.type_len]
 
-        type_map = {
-            BTF.KIND_INT: Int,
-            BTF.KIND_PTR: Ptr,
-            BTF.KIND_ARRAY: Array,
-            BTF.KIND_STRUCT: Struct,
-            BTF.KIND_UNION: Union,
-            BTF.KIND_ENUM: Enum,
-            BTF.KIND_FWD: Fwd,
-            BTF.KIND_TYPEDEF: TypeDef,
-            BTF.KIND_VOLATILE: Volatile,
-            BTF.KIND_CONST: Const,
-            BTF.KIND_RESTRICT: Restrict,
-            BTF.KIND_FUNC: Func,
-            BTF.KIND_FUNC_PROTO: FuncProto,
-            BTF.KIND_VAR: Var,
-            BTF.KIND_DATASEC: DataSec,
-        }
+    def eat(self, size):
+        if self.pos + size > len(self.type_data):
+             raise Exception(
+                "invalid BTF, 0x%x reaches the end of data" % (self.pos + size))
+        data = self.type_data[self.pos : self.pos + size]
+        self.pos += size
+        return data
+
+    def parse_one(self):
+        data = self.eat(12)
+        btf_type = struct.unpack("III", data)
+        name_off = btf_type[0]
+        info = btf_type[1]
+        size = type = btf_type[2]
+        vlen = info & 0xffff
+        kind = (info >> 24) & 0xf
+        kind_flag = info >> 31
+        name = self.offset2name(name_off)
+        cls = self.TYPE_MAP[kind]
+        type = cls.from_btf(self, name, size, type, vlen, kind_flag)
+        return type
+
+    def parse(self):
+        print("parsing types in '%s'" % self.btf_path, file=sys.stderr)
+        self.name2id = {}
+        # type ID start from 1
+        self.offsets = [None]
+        self.id2type = {}
 
         while self.pos < len(self.type_data):
-            data = self.eat(12)
-            btf_type = struct.unpack("III", data)
-            name_off = btf_type[0]
-            info = btf_type[1]
-            size = type = btf_type[2]
-            vlen = info & 0xffff
-            kind = (info >> 24) & 0xf
-            kind_flag = info >> 31
-            name = self.get_name(name_off)
+            id = len(self.offsets)
+            self.offsets.append(self.pos)
+            type = self.parse_one()
+            self.name2id["%s.%s" % (type.KIND, type.name)] = id
+            self.id2type[id] = type
+ 
+            # #self.name_map['%d.%s' % (kind, name)] = len(self.types)
+            # self.name_map[(kind, name)] = len(self.types)
+            # self.types.append(obj)
 
-            cls = type_map[kind]
-            obj = cls.from_btf(self, name, size, type, vlen, kind_flag)
-
-            #self.name_map['%d.%s' % (kind, name)] = len(self.types)
-            self.name_map[(kind, name)] = len(self.types)
-            self.types.append(obj)
-
-    def get_name(self, offset):
+    def offset2name(self, offset):
         if offset >= len(self.str_data):
             raise Exception("invalid BTF file, invalid name offset: 0x%x" % offset)
 
@@ -277,20 +349,34 @@ class BTF(object):
 
         return self.str_data[offset : offset + end].decode('ascii')
 
-    def get_type(self, kind, name):
-        type_id = self.name_map[(kind, name)]
-        return self.types[type_id]
+    def get(self, item, *args):
+        if isinstance(item, int):
+            id = item
+            if id >= len(self) or id <= 0:
+                if args:
+                    return args[0]
+                raise IndexError("invalid type id %s" % id)
+        else:
+            key = '%s.%s' % item
+            # key = str(item[0]) + '.' + item[1]
+            if key not in self.name2id:
+                if args:
+                    return args[0]
+                raise KeyError("no type name '%s' with kind %s" %
+                    (item[1], item[0]))
+            id = self.name2id[key]
+
+        if id in self.id2type:
+            return self.id2type[id]
+
+        self.pos = self.offsets[id]
+        self.id2type[id] = self.parse_one()
+        return self.id2type[id]
+        # type_id = self.name_map[(kind, name)]
+        # return self.types[type_id]
         # type_id = self.name_map['%d.%s' % (kind, name)]
         # type_info = self.types[type_id]
         # return self.assemble_type(type_info)
-
-    def eat(self, size):
-        if self.pos + size > len(self.type_data):
-             raise Exception(
-                "invalid BTF, 0x%x reaches the end of data" % (self.pos + size))
-        data = self.type_data[self.pos : self.pos + size]
-        self.pos += size
-        return data
 
 class BaseValue(object):
     def __init__(self, type, data=None, addr=None):
@@ -326,8 +412,6 @@ class BaseValue(object):
         return type(addr=self.addr)
 
 class BTFType(object):
-    __slots__ = ('name', )
-
     @classmethod
     def from_btf(cls, btf, name, size, type, vlen, kind_flag):
         raise NotImplementedError()
@@ -335,7 +419,6 @@ class BTFType(object):
     def __str__(self):
         if not self.name:
             return repr(self)
-            # return "%s-%s" % (self.__class__.__name__, id(self))
 
         return self.name
 
@@ -345,33 +428,23 @@ class BTFType(object):
 
         return self.Value(self, data, addr)
 
-    def __setstate__(self, d):
-        for slot in d:
-            setattr(self, slot, d[slot])
-
-    def __getstate__(self):
-        return { slot: getattr(self, slot) for slot in self.__slots__ }
-
     @property
     def ref(self):
         if not hasattr(self, 'type'):
             raise NotImplementedError()
-        
+
         if isinstance(self.type, int):
-            if self.type >= len(self.btf.types) or self.type <= 0:
-                raise Exception("invalid btf type %d" % self.type)
-            self.type = self.btf.types[self.type]
+            # if self.type >= len(self.btf) or self.type <= 0:
+            #     raise Exception("invalid btf type %d" % self.type)
+            self.type = self.btf[self.type]
 
         return self.type
 
     def is_kind(self, kind):
         return self.KIND == kind
 
+@BTF.register_type(BTF.KIND_INT)
 class Int(BTFType):
-    __slots__ = ('name', 'btf', 'name', 'size', 'signed',
-       'char', 'bool', 'offset', 'bits')
-    KIND = BTF.KIND_INT
-
     def __init__(self, btf, name, size, signed=False, char=False,
                  bool=False, offset=0, bits=0):
         self.btf = btf
@@ -428,8 +501,6 @@ class Int(BTFType):
             return str(int(self))
 
 class Ref(BTFType):
-    __slots__ = ('btf', 'name', 'type')
-
     def __init__(self, btf, name, type):
         self.btf = btf
         self.name = name
@@ -439,9 +510,8 @@ class Ref(BTFType):
     def from_btf(cls, btf, name, size, type, vlen, kind_flag):
         return cls(btf, name, type)
 
+@BTF.register_type(BTF.KIND_PTR)
 class Ptr(Ref):
-    KIND = BTF.KIND_PTR
-
     def __str__(self):
         return "%s *" % str(self.ref)
 
@@ -514,31 +584,27 @@ class Bedeck(Ref):
         def to_str(self, indent=0):
             return self.ref.to_str(indent)
 
+@BTF.register_type(BTF.KIND_TYPEDEF)
 class TypeDef(Bedeck):
-    KIND = BTF.KIND_TYPEDEF
+    pass
 
+@BTF.register_type(BTF.KIND_VOLATILE)
 class Volatile(Bedeck):
-    KIND = BTF.KIND_VOLATILE
-
     def __str__(self):
         return "volatile %s" % str(self.ref)
 
+@BTF.register_type(BTF.KIND_CONST)
 class Const(Bedeck):
-    KIND = BTF.KIND_CONST
-
     def __str__(self):
         return "const %s" % str(self.ref)
 
+@BTF.register_type(BTF.KIND_RESTRICT)
 class Restrict(Bedeck):
-    KIND = BTF.KIND_RESTRICT
-
     def __str__(self):
         return "restrict %s" % str(self.ref)
 
+@BTF.register_type(BTF.KIND_ARRAY)
 class Array(BTFType):
-    __slots__ = ('btf', 'name', 'type', 'nelems')
-    KIND = BTF.KIND_ARRAY
-
     def __init__(self, btf, name, type, nelems):
         self.btf = btf
         self.name = name
@@ -632,25 +698,19 @@ class Array(BTFType):
                 txt += '}'
             return txt
 
-class StructMember(BTFType):
-    __slots__ = ('parent', 'btf', 'name', 'type',
-       'offset_bits', 'offset', 'size')
-
-    def __init__(self, parent, btf, name, type, offset, size):
-        self.parent = parent
-        self.btf = btf
-        self.name = name
-        self.type = type
-        self.offset_bits = offset
-        self.offset = offset / 8
-        self.size = size
-
-    def __call__(self, *args, **kwargs):
-        return NotImplementedError()
-
 class StructUnion(BTFType):
-    __slots__ = ('btf', 'name', 'vlen', 'size', 'members',
-       'member_map', 'anonymous_members')
+    class Member(BTFType):
+        def __init__(self, parent, btf, name, type, offset, size):
+            self.parent = parent
+            self.btf = btf
+            self.name = name
+            self.type = type
+            self.offset_bits = offset
+            self.offset = offset / 8
+            self.size = size
+
+        def __call__(self, *args, **kwargs):
+            return NotImplementedError()
 
     def __init__(self, btf, name, vlen, size):
         self.btf = btf
@@ -687,7 +747,7 @@ class StructUnion(BTFType):
 
     def add_member(self, name, type, offset, size):
         self.members.append(
-            StructMember(self, self.btf, name, type, offset, size))
+            self.Member(self, self.btf, name, type, offset, size))
         if not name:
             self.anonymous_members.append(self.members[-1])
         else:
@@ -700,7 +760,7 @@ class StructUnion(BTFType):
             data = btf.eat(12)
             info = struct.unpack("III", data)
             obj.add_member(
-                btf.get_name(info[0]), info[1], info[2] & 0xffffff, info[2] >> 24)
+                btf.offset2name(info[0]), info[1], info[2] & 0xffffff, info[2] >> 24)
         return obj
 
     class Value(BaseValue):
@@ -743,33 +803,27 @@ class StructUnion(BTFType):
             txt += indent * self.btf.blank  + '}'
             return txt
 
+@BTF.register_type(BTF.KIND_STRUCT)
 class Struct(StructUnion):
-    KIND = BTF.KIND_STRUCT
-
     def __str__(self):
         return "struct %s" % str(self.name)
 
+@BTF.register_type(BTF.KIND_UNION)
 class Union(StructUnion):
-    KIND = BTF.KIND_UNION
-
     def __str__(self):
         return "union %s" % str(self.name)
 
-class EnumMember(BTFType):
-    __slots__ = ('parent', 'btf', 'name', 'val')
-
-    def __init__(self, parent, btf, name, val):
-        self.parent = parent
-        self.btf = btf
-        self.name = name
-        self.val = val
-
-    def __call__(self, *args, **kwargs):
-        return NotImplementedError()
-
+@BTF.register_type(BTF.KIND_ENUM)
 class Enum(Int):
-    __slots__ = ('vlen', 'members', 'member_map', 'value_map')
-    KIND = BTF.KIND_ENUM
+    class Member(BTFType):
+        def __init__(self, parent, btf, name, val):
+            self.parent = parent
+            self.btf = btf
+            self.name = name
+            self.val = val
+
+        def __call__(self, *args, **kwargs):
+            return NotImplementedError()
 
     def __init__(self, btf, name, vlen, size):
         self.vlen = vlen
@@ -782,7 +836,7 @@ class Enum(Int):
         return "enum %s" % str(self.name)
 
     def add_member(self, name, val):
-        self.members.append(EnumMember(self, self.btf, name, val))
+        self.members.append(self.Member(self, self.btf, name, val))
         self.member_map[name] = self.members[-1]
         self.value_map[val] = self.members[-1]
 
@@ -792,7 +846,7 @@ class Enum(Int):
         for _ in range(vlen):
             data = btf.eat(8)
             info = struct.unpack("Ii", data)
-            obj.add_member(btf.get_name(info[0]), info[1])
+            obj.add_member(btf.offset2name(info[0]), info[1])
         return obj
 
     class Value(Int.Value):
@@ -808,10 +862,8 @@ class Enum(Int):
 
             return super().to_str(indent)
 
+@BTF.register_type(BTF.KIND_FWD)
 class Fwd(BTFType):
-    __slots__ = ('btf', 'name', 'kind_flag')
-    KIND = BTF.KIND_FWD
-
     def __init__(self, btf, name, kind_flag):
         self.btf = btf
         self.name = name
@@ -827,10 +879,8 @@ class Fwd(BTFType):
     def from_btf(cls, btf, name, size, type, vlen, kind_flag):
         return cls(btf, name, kind_flag)
 
+@BTF.register_type(BTF.KIND_FUNC_PROTO)
 class FuncProto(BTFType):
-    __slots__ = ('btf', 'name', 'vlen', 'type')
-    KIND = BTF.KIND_FUNC_PROTO
-
     def __init__(self, btf, name, vlen, type):
         self.btf = btf
         self.name = name
@@ -856,13 +906,12 @@ class FuncProto(BTFType):
         def to_str(self, indent):
             return '0x%x' % int(self)
 
+@BTF.register_type(BTF.KIND_FUNC)
 class Func(Ref):
-    KIND = BTF.KIND_FUNC
+    pass
 
+@BTF.register_type(BTF.KIND_VAR)
 class Var(BTFType):
-    __slots__ = ('btf', 'name', 'type')
-    KIND = BTF.KIND_VAR
-
     def __init__(self, btf, name, type):
         self.btf = btf
         self.name = name
@@ -873,10 +922,8 @@ class Var(BTFType):
         btf.eat(4)
         return cls(btf, name, type)
 
+@BTF.register_type(BTF.KIND_DATASEC)
 class DataSec(BTFType):
-    __slots__ = ('btf', 'name', 'vlen', 'size')
-    KIND = BTF.KIND_DATASEC
-
     def __init__(self, btf, name, vlen, size):
         self.btf = btf
         self.name = name
@@ -1293,15 +1340,15 @@ class Dumper(object):
     def get_btf_type(self, typecast):
         if typecast.keyword == 'struct':
             try:
-                type = self.btf.get_type(BTF.KIND_STRUCT, typecast.new_type)
+                type = self.btf[(BTF.KIND_STRUCT, typecast.new_type)]
             except KeyError:
                 raise Exception("can't find struct '%s'" % typecast.new_type)
         else:
             try:
-                type = self.btf.get_type(BTF.KIND_INT, typecast.new_type)
+                type = self.btf[(BTF.KIND_INT, typecast.new_type)]
             except KeyError:
                 try:
-                    type = self.btf.get_type(BTF.KIND_TYPEDEF, typecast.new_type)
+                    type = self.btf[(BTF.KIND_TYPEDEF, typecast.new_type)]
                 except KeyError:
                     raise Exception("can't find symbol '%s'" % typecast.new_type)
 
