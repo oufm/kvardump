@@ -18,6 +18,8 @@ import traceback
 
 DEFAULT_ARRAY_MAX = 5
 DEFAULT_STRING_MAX = 64
+DEFAULT_BTF_PATH = '/sys/kernel/btf/vmlinux'
+DEFAULT_CACHE_DIR = '/tmp/kvardump'
 
 verbose = False
 log_nest_level = 0
@@ -138,6 +140,20 @@ def log_arg_ret(func):
 
 #     return _func
 
+class FormatOpt(object):
+    def __init__(self,
+                 array_max=DEFAULT_ARRAY_MAX,
+                 string_max=DEFAULT_STRING_MAX,
+                 array_max_force=False,
+                 string_max_force=False,
+                 hex_string=False,
+                 blank='    '):
+        self.array_max = array_max
+        self.string_max = string_max
+        self.array_max_force = array_max_force
+        self.string_max_force = string_max_force
+        self.hex_string = hex_string
+        self.blank = blank
 
 class BTF(object):
     KIND_INT = 1
@@ -157,22 +173,17 @@ class BTF(object):
     KIND_DATASEC = 15
     TYPE_MAP = {}
 
-    def __init__(self, btf_path, cache_dir='/tmp/kvardump', mem_reader=None,
-                 array_max=DEFAULT_ARRAY_MAX, string_max=DEFAULT_STRING_MAX,
-                 array_max_force=False, string_max_force=False,
-                 hex_string=False, blank='    '):
+    def __init__(self,
+                 btf_path=DEFAULT_BTF_PATH,
+                 cache_dir=DEFAULT_CACHE_DIR,
+                 mem_reader=None, fmt=FormatOpt()):
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
         self.btf_path = btf_path
         self.mem_reader = mem_reader
-        self.array_max = array_max
-        self.string_max = string_max
-        self.array_max_force = array_max_force
-        self.string_max_force = string_max_force
-        self.hex_string = hex_string
-        self.blank = blank
+        self.fmt = fmt
 
         self.open_btf()
 
@@ -197,38 +208,6 @@ class BTF(object):
                 print("save cache to %s failed: %s" % (cache_path, e),
                         file=sys.stderr)
                 log_exception()
-        # if os.path.exists('/tmp/kvardump_cache.json'):
-        #     with open('/tmp/kvardump_cache.json', 'r') as f:
-        #         obj = json.load(f)
-        #         self.types = obj['types']
-        #         self.name_map = obj['name_map']
-        #     return
-
-        # if cache_path and os.path.exists(cache_path):
-        #     print("loading types from cache '%s'" % cache_path, file=sys.stderr)
-        #     with open(cache_path, 'rb') as f:
-        #         obj = pickle.load(f)
-        #         self.types = obj.types
-        #         self.name_map = obj.name_map
-        # else:
-        # if True:
-        #     # type ID start from 1
-        #     self.types = [{}]
-        #     self.name_map = {}
-
-        #     print("parsing types from cache '%s'" % btf_path, file=sys.stderr)
-        #     self.parse(btf_path)
-
-        #     # if cache_path:
-        #     #     print("writing types to cache '%s'" % cache_path, file=sys.stderr)
-        #     #     # obj = {
-        #     #     #     'types': self.types,
-        #     #     #     'name_map': self.name_map,
-        #     #     # }
-        #     #     with open(cache_path, 'wb') as f:
-        #     #         # import pdb
-        #     #         # pdb.set_trace()
-        #     #         pickle.dump(self, f)
 
     def __getitem__(self, kind_name):
         return self.get(kind_name)
@@ -334,10 +313,6 @@ class BTF(object):
             type = self.parse_one()
             self.name2id["%s.%s" % (type.KIND, type.name)] = id
             self.id2type[id] = type
- 
-            # #self.name_map['%d.%s' % (kind, name)] = len(self.types)
-            # self.name_map[(kind, name)] = len(self.types)
-            # self.types.append(obj)
 
     def offset2name(self, offset):
         if offset >= len(self.str_data):
@@ -372,11 +347,6 @@ class BTF(object):
         self.pos = self.offsets[id]
         self.id2type[id] = self.parse_one()
         return self.id2type[id]
-        # type_id = self.name_map[(kind, name)]
-        # return self.types[type_id]
-        # type_id = self.name_map['%d.%s' % (kind, name)]
-        # type_info = self.types[type_id]
-        # return self.assemble_type(type_info)
 
 class BaseValue(object):
     def __init__(self, type, data=None, addr=None):
@@ -385,6 +355,7 @@ class BaseValue(object):
 
         self.type = type
         self.btf = type.btf
+        self.fmt = type.btf.fmt
         self._data = data
         self.addr = addr
 
@@ -434,8 +405,6 @@ class BTFType(object):
             raise NotImplementedError()
 
         if isinstance(self.type, int):
-            # if self.type >= len(self.btf) or self.type <= 0:
-            #     raise Exception("invalid btf type %d" % self.type)
             self.type = self.btf[self.type]
 
         return self.type
@@ -640,12 +609,12 @@ class Array(BTFType):
 
         def dump_byte_array(self, indent):
             omit_tip = ''
-            if (indent > 0 or self.btf.string_max_force) and \
-                    self.type.nelems > self.btf.string_max:
-                data = self.data[:self.btf.string_max]
+            if (indent > 0 or self.fmt.string_max_force) and \
+                    self.type.nelems > self.fmt.string_max:
+                data = self.data[:self.fmt.string_max]
                 omit_tip = '...'
 
-            if not self.btf.hex_string:
+            if not self.fmt.hex_string:
                 try:
                     # dump as string if there is no unprintable character
                     str_val = self.data.decode('ascii')
@@ -670,10 +639,10 @@ class Array(BTFType):
                 return self.dump_byte_array(indent)
 
             # dump array in each line
-            if (indent > 0 or self.btf.array_max_force) and \
-                    array_len > self.btf.array_max:
-                omit_count = array_len - self.btf.array_max
-                array_len = self.btf.array_max
+            if (indent > 0 or self.fmt.array_max_force) and \
+                    array_len > self.fmt.array_max:
+                omit_count = array_len - self.fmt.array_max
+                array_len = self.fmt.array_max
 
             indent += 1
             if elem_type.is_kind(BTF.KIND_INT):
@@ -683,7 +652,7 @@ class Array(BTFType):
             else:
                 txt = '{\n'
                 sep = '\n'
-                before = indent * self.btf.blank
+                before = indent * self.fmt.blank
 
             for i in range(array_len):
                 txt += before + self[i].to_str(indent) + ',' + sep
@@ -693,7 +662,7 @@ class Array(BTFType):
                                 omit_count, sep)
             indent -= 1
             if sep == '\n':
-                txt += indent * self.btf.blank + '}'
+                txt += indent * self.fmt.blank + '}'
             else:
                 txt += '}'
             return txt
@@ -791,16 +760,16 @@ class StructUnion(BTFType):
             indent += 1
             for m in self.type.members:
                 if m.name:
-                    txt += indent * self.btf.blank + '.' + m.name + ' = '
+                    txt += indent * self.fmt.blank + '.' + m.name + ' = '
                 elif m.ref.is_kind(BTF.KIND_STRUCT):
-                    txt += indent * self.btf.blank  + '/* nested anonymous struct */ '
+                    txt += indent * self.fmt.blank  + '/* nested anonymous struct */ '
                 else:
-                    txt += indent * self.btf.blank  + '/* nested anonymous union */ '
+                    txt += indent * self.fmt.blank  + '/* nested anonymous union */ '
                 txt += self._get(m).to_str(indent)
                 txt += ',\n'
 
             indent -= 1
-            txt += indent * self.btf.blank  + '}'
+            txt += indent * self.fmt.blank  + '}'
             return txt
 
 @BTF.register_type(BTF.KIND_STRUCT)
@@ -1312,21 +1281,18 @@ class Parser(object):
 class Dumper(object):
     BLANK = '    '
 
-    def __init__(self,
-                 array_max=DEFAULT_ARRAY_MAX, string_max=DEFAULT_STRING_MAX,
-                 array_max_force=False, string_max_force=False,
-                 hex_string=False, btf_path='/sys/kernel/btf/vmlinux'):
-
-        self.array_max = array_max
-        self.string_max = string_max
-        self.array_max_force = array_max_force
-        self.string_max_force = string_max_force
-        self.hex_string = hex_string
+    def __init__(self, fmt=FormatOpt(),
+                 btf_path=DEFAULT_BTF_PATH, cache_dir=DEFAULT_CACHE_DIR):
         self.kernel_mem = KernelMem()
-        self.btf = BTF(btf_path, mem_reader=self.kernel_mem)
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
+
+        path_list = btf_path if isinstance(btf_path, list) else [btf_path]
+        self.btfs = [BTF(path, mem_reader=self.kernel_mem,
+                         fmt=fmt, cache_dir=cache_dir) for path in path_list]
+        # self.btf = BTF(btf_path, mem_reader=self.kernel_mem,
+        #         fmt=fmt, cache_dir=cache_dir)
 
     @log_arg_ret
     def dereference_addr(self, address):
@@ -1338,25 +1304,32 @@ class Dumper(object):
         return struct.unpack('P', data)[0]
 
     def get_btf_type(self, typecast):
-        if typecast.keyword == 'struct':
-            try:
-                type = self.btf[(BTF.KIND_STRUCT, typecast.new_type)]
-            except KeyError:
-                raise Exception("can't find struct '%s'" % typecast.new_type)
-        else:
-            try:
-                type = self.btf[(BTF.KIND_INT, typecast.new_type)]
-            except KeyError:
+        type = None
+        for btf in self.btfs:
+            if typecast.keyword == 'struct':
                 try:
-                    type = self.btf[(BTF.KIND_TYPEDEF, typecast.new_type)]
+                    type = btf[(BTF.KIND_STRUCT, typecast.new_type)]
                 except KeyError:
-                    raise Exception("can't find symbol '%s'" % typecast.new_type)
+                    continue
+            else:
+                try:
+                    type = btf[(BTF.KIND_INT, typecast.new_type)]
+                except KeyError:
+                    try:
+                        type = btf[(BTF.KIND_TYPEDEF, typecast.new_type)]
+                    except KeyError:
+                        continue
+            break
+
+        if not type:
+            raise Exception(
+                "can't find symbol %s%s" % (typecast.keyword, typecast.new_type))
 
         for idx in typecast.indexes:
-            type = Array(self.btf, '', type, idx)
+            type = Array(type.btf, '', type, idx)
 
         for i in range(typecast.ref_level):
-            type = Ptr(self.btf, '', type)
+            type = Ptr(type.btf, '', type)
 
         return type
 
@@ -1544,8 +1517,12 @@ if __name__ == '__main__':
     parser.add_argument('-w', '--watch-interval', type=float,
                         help='check the expression value every WATCH_INTERVAL '
                              'seconds and dump it when it changes')
-    parser.add_argument('-t', '--btf', type=str,
-                        help='BTF file path', default='/sys/kernel/btf/vmlinux')
+    parser.add_argument('-t', '--btf-paths', type=str,
+                        help='BTF paths, separated by ","',
+                        default=DEFAULT_BTF_PATH)
+    parser.add_argument('-c', '--cache-dir', type=str,
+                        help='directory to save cache, set empty to disable cache',
+                        default=DEFAULT_CACHE_DIR)
     args = parser.parse_args()
 
     verbose = args.verbose
@@ -1553,11 +1530,13 @@ if __name__ == '__main__':
     string_max = args.string_max if args.string_max > 0 else DEFAULT_STRING_MAX
     array_max_force = bool(args.array_max > 0)
     string_max_force = bool(args.string_max > 0)
+    fmt = FormatOpt(array_max=array_max, array_max_force=array_max_force,
+                    hex_string=args.hex_string, string_max=string_max,
+                    string_max_force=string_max_force)
 
     try:
-        dumper = Dumper(array_max=array_max, array_max_force=array_max_force,
-                        hex_string=args.hex_string, string_max=string_max,
-                        string_max_force=string_max_force, btf_path=args.btf)
+        dumper = Dumper(btf_path=args.btf_paths.split(','),
+                        fmt=fmt, cache_dir=args.cache_dir)
         do_dump(dumper, args.expression, args.watch_interval)
     except Exception as e:
         print("Error: %s" % get_err_txt(e), file=sys.stderr)
