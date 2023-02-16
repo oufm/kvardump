@@ -5,7 +5,6 @@ import os
 import re
 import sys
 import time
-import copy
 import json
 import codecs
 import hashlib
@@ -22,7 +21,9 @@ DEFAULT_BTF_PATH = '/sys/kernel/btf/vmlinux'
 DEFAULT_CACHE_DIR = '/tmp/kvardump'
 
 verbose = False
+quiet = False
 log_nest_level = 0
+
 
 try:
     from six import reraise
@@ -34,58 +35,39 @@ except ImportError:
         exec("def reraise(exc_type, exc_value, exc_traceback):\n"
             "    raise exc_type, exc_value, exc_traceback\n")
 
-def get_err_txt(err):
+
+def err_txt(err):
     return getattr(err, "show_txt", str(err))
 
 
-def append_err_txt(err, txt_before='', txt_after=''):
-    err.show_txt = "%s%s%s" % (txt_before, get_err_txt(err), txt_after)
+def append_err(err, txt_before='', txt_after=''):
+    err.show_txt = "%s%s%s" % (txt_before, err_txt(err), txt_after)
+
+
+def info(txt):
+    if not quiet:
+        print(txt, file=sys.stderr)
+
+
+def debug(txt):
+    if verbose:
+        print(txt, file=sys.stderr)
+
+
+def error(txt):
+    print("Error: %s" % txt, file=sys.stderr)
 
 
 def log_exception():
     if not verbose:
         return
     exc_type, exc_value, exc_traceback = sys.exc_info()
-    print("Error: %s" % get_err_txt(exc_value), file=sys.stderr)
+    error(err_txt(exc_value))
     traceback.print_exception(exc_type, exc_value, exc_traceback,
                               file=sys.stderr)
 
 
-def pretty(value, htchar='\t', lfchar='\n', max_depth=0, indent=0):
-    nlch = lfchar + htchar * (indent + 1)
-    if isinstance(value, dict):
-        if max_depth and indent >= max_depth:
-            return '{...}'
-        items = [
-            nlch + str(key) + ': ' + pretty(
-                value[key], htchar, lfchar, max_depth, indent + 1)
-            for key in value
-        ]
-        return '{%s}' % (','.join(items) + lfchar + htchar * indent)
-    elif isinstance(value, list):
-        if max_depth and indent >= max_depth:
-            return '[...]'
-        items = [
-            nlch + pretty(item, htchar, lfchar, max_depth, indent + 1)
-            for item in value
-        ]
-        return '[%s]' % (','.join(items) + lfchar + htchar * indent)
-    elif isinstance(value, tuple):
-        if max_depth and indent >= max_depth:
-            return '(...)'
-        items = [
-            nlch + pretty(item, htchar, lfchar, max_depth, indent + 1)
-            for item in value
-        ]
-        return '(%s)' % (','.join(items) + lfchar + htchar * indent)
-    else:
-        return str(value)
-
-
-def log_arg_ret(func):
-    def show(var):
-        return pretty(var, htchar='', lfchar=' ', max_depth=2)
-
+def log_call(func):
     @functools.wraps(func)
     def _func(*args, **kwargs):
         global log_nest_level
@@ -98,47 +80,20 @@ def log_arg_ret(func):
             log_nest_level -= 1
             if verbose:
                 args = args[1:]
-                arg_str1 = ', '.join([show(i) for i in args])
-                arg_str2 = ', '.join([show(k) + '=' + show(v)
+                arg_str1 = ', '.join([str(i) for i in args])
+                arg_str2 = ', '.join([str(k) + '=' + str(v)
                                       for k, v in kwargs.items()])
                 if arg_str1 and arg_str2:
                     arg_str = arg_str1 + ', ' + arg_str2
                 else:
                     arg_str = arg_str1 + arg_str2
                 print("call[%d]: %s(%s) = '%s'" %
-                      (log_nest_level, func.__name__, arg_str, show(ret)),
+                      (log_nest_level, func.__name__, arg_str, str(ret)),
                       file=sys.stderr)
         return ret
 
     return _func
 
-
-# def cache_result(func):
-#     @functools.wraps(func)
-#     def _func(self, *args, **kwargs):
-#         param_tuple = (tuple(args), frozenset(kwargs))
-#         cache_name = '_%s_cache' % func.__name__
-#         cache_dict = getattr(self, cache_name, {})
-#         if not cache_dict:
-#             setattr(self, cache_name, cache_dict)
-
-#         cache_value = copy.deepcopy(cache_dict.get(param_tuple, None))
-#         if isinstance(cache_value, Exception):
-#             raise cache_value
-
-#         if cache_value is not None:
-#             return cache_value
-
-#         try:
-#             cache_value = func(self, *args, **kwargs)
-#         except Exception as e:
-#             cache_dict[param_tuple] = copy.deepcopy(e)
-#             reraise(*sys.exc_info())
-#         else:
-#             cache_dict[param_tuple] = copy.deepcopy(cache_value)
-#         return cache_value
-
-#     return _func
 
 class FormatOpt(object):
     def __init__(self,
@@ -154,6 +109,7 @@ class FormatOpt(object):
         self.string_max_force = string_max_force
         self.hex_string = hex_string
         self.blank = blank
+
 
 class BTF(object):
     KIND_VOID = 0
@@ -349,6 +305,7 @@ class BTF(object):
         self.id2type[id] = self.parse_one()
         return self.id2type[id]
 
+
 class BaseValue(object):
     def __init__(self, type, data=None, addr=None):
         if not data and not addr:
@@ -383,6 +340,7 @@ class BaseValue(object):
             raise Exception("address of '%s' has not been set" % repr(self))
         return type(addr=self.addr)
 
+
 class BTFType(object):
     @classmethod
     def from_btf(cls, btf, name, size, type, vlen, kind_flag):
@@ -413,6 +371,7 @@ class BTFType(object):
     def is_kind(self, kind):
         return self.KIND == kind
 
+
 @BTF.register_type(BTF.KIND_VOID)
 class Int(BTFType):
     def __init__(self, btf, name):
@@ -422,6 +381,7 @@ class Int(BTFType):
     @classmethod
     def from_btf(cls, btf, name, size, type, vlen, kind_flag):
         return cls(btf, name)
+
 
 @BTF.register_type(BTF.KIND_INT)
 class Int(BTFType):
@@ -480,6 +440,7 @@ class Int(BTFType):
                 return str(bool(int(self)))
             return str(int(self))
 
+
 class Ref(BTFType):
     def __init__(self, btf, name, type):
         self.btf = btf
@@ -489,6 +450,7 @@ class Ref(BTFType):
     @classmethod
     def from_btf(cls, btf, name, size, type, vlen, kind_flag):
         return cls(btf, name, type)
+
 
 @BTF.register_type(BTF.KIND_PTR)
 class Ptr(Ref):
@@ -521,6 +483,7 @@ class Ptr(Ref):
                 msg = "dereference value failed: %s" % (
                     str(sys.exc_info()[1]))
                 reraise(Exception, msg, sys.exc_info()[2])
+
 
 class Bedeck(Ref):
     def __getattr__(self, name):
@@ -564,24 +527,29 @@ class Bedeck(Ref):
         def to_str(self, indent=0):
             return self.ref.to_str(indent)
 
+
 @BTF.register_type(BTF.KIND_TYPEDEF)
 class TypeDef(Bedeck):
     pass
+
 
 @BTF.register_type(BTF.KIND_VOLATILE)
 class Volatile(Bedeck):
     def __str__(self):
         return "volatile %s" % str(self.ref)
 
+
 @BTF.register_type(BTF.KIND_CONST)
 class Const(Bedeck):
     def __str__(self):
         return "const %s" % str(self.ref)
 
+
 @BTF.register_type(BTF.KIND_RESTRICT)
 class Restrict(Bedeck):
     def __str__(self):
         return "restrict %s" % str(self.ref)
+
 
 @BTF.register_type(BTF.KIND_ARRAY)
 class Array(BTFType):
@@ -678,6 +646,7 @@ class Array(BTFType):
             else:
                 txt += '}'
             return txt
+
 
 class StructUnion(BTFType):
     class Member(BTFType):
@@ -783,15 +752,18 @@ class StructUnion(BTFType):
             txt += indent * self.fmt.blank  + '}'
             return txt
 
+
 @BTF.register_type(BTF.KIND_STRUCT)
 class Struct(StructUnion):
     def __str__(self):
         return "struct %s" % str(self.name)
 
+
 @BTF.register_type(BTF.KIND_UNION)
 class Union(StructUnion):
     def __str__(self):
         return "union %s" % str(self.name)
+
 
 @BTF.register_type(BTF.KIND_ENUM)
 class Enum(Int):
@@ -842,6 +814,7 @@ class Enum(Int):
 
             return super(self.__class__, self).to_str(indent)
 
+
 @BTF.register_type(BTF.KIND_FWD)
 class Fwd(BTFType):
     def __init__(self, btf, name, kind_flag):
@@ -858,6 +831,7 @@ class Fwd(BTFType):
     @classmethod
     def from_btf(cls, btf, name, size, type, vlen, kind_flag):
         return cls(btf, name, kind_flag)
+
 
 @BTF.register_type(BTF.KIND_FUNC_PROTO)
 class FuncProto(BTFType):
@@ -886,9 +860,11 @@ class FuncProto(BTFType):
         def to_str(self, indent=0):
             return '0x%x' % int(self)
 
+
 @BTF.register_type(BTF.KIND_FUNC)
 class Func(Ref):
     pass
+
 
 @BTF.register_type(BTF.KIND_VAR)
 class Var(BTFType):
@@ -901,6 +877,7 @@ class Var(BTFType):
     def from_btf(cls, btf, name, size, type, vlen, kind_flag):
         btf.eat(4)
         return cls(btf, name, type)
+
 
 @BTF.register_type(BTF.KIND_DATASEC)
 class DataSec(BTFType):
@@ -915,6 +892,7 @@ class DataSec(BTFType):
         btf.eat(12 * vlen)
         return cls(btf, name, vlen, size)
 
+
 class KernelMem(object):
     def __init__(self):
         self.segs = []
@@ -924,8 +902,7 @@ class KernelMem(object):
             "objdump -h /proc/kcore  | grep load | awk '{print $3,$4,$6}'",
             shell=True).decode()
 
-        if verbose:
-            print("memory segments: ", file=sys.stderr)
+        debug("memory segments: ")
 
         for l in output.splitlines():
             tokens = l.split()
@@ -935,12 +912,10 @@ class KernelMem(object):
                 'off': int('0x' + tokens[2], base=0),
             })
 
-            if verbose:
-                print("     0x%x ~ 0x%x @ 0x%x" % (
-                        self.segs[-1]['vma'],
-                        self.segs[-1]['vma'] + self.segs[-1]['len'],
-                        self.segs[-1]['off']),
-                        file=sys.stderr)
+            debug("     0x%x ~ 0x%x @ 0x%x" % (
+                    self.segs[-1]['vma'],
+                    self.segs[-1]['vma'] + self.segs[-1]['len'],
+                    self.segs[-1]['off']))
 
     def read(self, addr, size):
         off = None
@@ -955,6 +930,7 @@ class KernelMem(object):
 
         self.kcore.seek(off)
         return self.kcore.read(size)
+
 
 class Token(object):
     pass
@@ -1197,7 +1173,7 @@ class Parser(object):
                 "unexpected token '%s' after expression '%s'" % (token, expr))
         return expr
 
-    @log_arg_ret
+    @log_call
     def parse_expr(self):
         # try to parse with typecast first
         try:
@@ -1241,7 +1217,7 @@ class Parser(object):
         # then try to parse without typecast
         return self.parse_term()
 
-    @log_arg_ret
+    @log_call
     def parse_term(self):
         token = self.lexer.next_token()
         if isinstance(token, Asterisk):
@@ -1266,7 +1242,7 @@ class Parser(object):
 
         return term
 
-    @log_arg_ret
+    @log_call
     def parse_variable(self):
         token = self.lexer.next_token()
         if isinstance(token, Symbol) or isinstance(token, Number):
@@ -1278,6 +1254,7 @@ class Parser(object):
         else:
             raise self.lexer.error_with_last_pos(
                 "expect symbol, number or expression, but get '%s'" % token)
+
 
 class Dumper(object):
     BLANK = '    '
@@ -1293,7 +1270,7 @@ class Dumper(object):
         self.btfs = [BTF(path, mem_reader=mem_reader,
                          fmt=fmt, cache_dir=cache_dir) for path in path_list]
 
-    @log_arg_ret
+    @log_call
     def dereference_addr(self, address):
         try:
             data = self.mem_reader.read(address, self.arch_size)
@@ -1302,6 +1279,7 @@ class Dumper(object):
 
         return struct.unpack('P', data)[0]
 
+    @log_call
     def get_type(self, typecast):
         type = None
         if isinstance(typecast, str):
@@ -1336,6 +1314,7 @@ class Dumper(object):
         return type
 
     @staticmethod
+    @log_call
     def get_symbol_addr(name):
         try:
             output = subprocess.check_output(
@@ -1343,10 +1322,10 @@ class Dumper(object):
                 shell=True).decode()
             return int('0x' + output, base=0)
         except Exception as e:
-            append_err_txt(e, "failed to get address of symbol '%s': " % name)
+            append_err(e, "failed to get address of symbol '%s': " % name)
             reraise(*sys.exc_info())
 
-    @log_arg_ret
+    @log_call
     def get_addr_type(self, expr):
         if isinstance(expr, Typecast):
             addr, _ = self.get_addr_type(expr.variable)
@@ -1451,7 +1430,7 @@ def do_dump(dumper, expression_list, watch_interval=None):
             }
             expr_list.append(info)
         except Exception as e:
-            append_err_txt(e, "parse '%s' failed: " % expression)
+            append_err(e, "parse '%s' failed: " % expression)
             reraise(*sys.exc_info())
 
     while True:
@@ -1464,13 +1443,13 @@ def do_dump(dumper, expression_list, watch_interval=None):
                     info['last_data'] = value.data
             except Exception as e:
                 if len(expression_list) == 1 and watch_interval is None:
-                    append_err_txt(e, "dump '%s' failed: " % info['expr'])
+                    append_err(e, "dump '%s' failed: " % info['expr'])
                     reraise(*sys.exc_info())
                 else:
                     log_exception()
 
                 if info['last_data'] != '':
-                    txt += ("Error: %s: %s\n" % (info['expr'], get_err_txt(e)))
+                    txt += ("Error: %s: %s\n" % (info['expr'], err_txt(e)))
                     info['last_data'] = ''
 
         if watch_interval is None:
@@ -1497,27 +1476,6 @@ def show_netdev(dumper):
         print("%s @ 0x%x" % (dev.name, dev.addr))
         next = next.next
 
-# def show_netdev():
-#     dumper = Dumper()
-#     expr = Parser(Lexer('((struct net) init_net).dev_base_head.next')).parse()
-#     value = dumper.eval(expr)
-#     next_type = type
-#     next = int(value)
-
-#     netdev_type = dumper.btf.get_type(BTF.KIND_STRUCT, "net_device")
-#     offset = dumper.get_member_offset_and_type(netdev_type, 'dev_list')[0]
-
-#     while next:
-#         dev_addr = next - offset
-#         expr = Parser(Lexer('((struct net_device) %d).name' % dev_addr)).parse()
-#         data, type = dumper.get_data_and_type(expr)
-#         dev_name = dumper.dump_type(data, type)
-#         print("%s 0x%x" % (dev_name, dev_addr))
-
-#         expr = Parser(Lexer('((struct list_head) %d).prev' % next)).parse()
-#         data, type = dumper.get_data_and_type(expr)
-#         next = int(dumper.dump_type(data, type), base=0)
-
 if __name__ == '__main__':
     epilog = """examples:
     * dump the kernel init_net structure:
@@ -1536,6 +1494,8 @@ if __name__ == '__main__':
                         'or "netdev" to list net devices')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='show debug information')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='suppress log')
     parser.add_argument('-x', '--hex-string', action='store_true',
                         help='dump byte array in hex instead of string')
     parser.add_argument('-a', '--array-max', type=int, default=0,
@@ -1554,6 +1514,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     verbose = args.verbose
+    quiet = args.quiet
     array_max = args.array_max if args.array_max > 0 else DEFAULT_ARRAY_MAX
     string_max = args.string_max if args.string_max > 0 else DEFAULT_STRING_MAX
     array_max_force = bool(args.array_max > 0)
@@ -1570,7 +1531,7 @@ if __name__ == '__main__':
         else:
             do_dump(dumper, args.expression, args.watch_interval)
     except Exception as e:
-        print("Error: %s" % get_err_txt(e), file=sys.stderr)
+        print("Error: %s" % err_txt(e), file=sys.stderr)
         if verbose:
             reraise(*sys.exc_info())
         exit(1)
