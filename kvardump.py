@@ -8,7 +8,6 @@ import time
 import json
 import codecs
 import hashlib
-import subprocess
 import argparse
 import platform
 import struct
@@ -897,25 +896,42 @@ class KernelMem(object):
     def __init__(self):
         self.segs = []
         self.kcore = open('/proc/kcore', 'rb')
+        self.load_segs()
 
-        output = subprocess.check_output(
-            "objdump -h /proc/kcore  | grep load | awk '{print $3,$4,$6}'",
-            shell=True).decode()
+    def load_segs(self):
+        self.kcore.seek(0x20)
+        first = struct.unpack('L', self.kcore.read(8))[0]
+
+        self.kcore.seek(0x36)
+        ent_size = struct.unpack('H', self.kcore.read(2))[0]
+
+        self.kcore.seek(0x38)
+        count = struct.unpack('H', self.kcore.read(2))[0]
 
         debug("memory segments: ")
 
-        for l in output.splitlines():
-            tokens = l.split()
-            self.segs.append({
-                'vma': int('0x' + tokens[1], base=0),
-                'len': int('0x' + tokens[0], base=0),
-                'off': int('0x' + tokens[2], base=0),
-            })
+        for i in range(count):
+            self.kcore.seek(first + ent_size * i + 0)
+            type = struct.unpack('I', self.kcore.read(4))[0]
+            if type != 1:
+                continue
 
-            debug("     0x%x ~ 0x%x @ 0x%x" % (
-                    self.segs[-1]['vma'],
-                    self.segs[-1]['vma'] + self.segs[-1]['len'],
-                    self.segs[-1]['off']))
+            self.kcore.seek(first + ent_size * i + 0x8)
+            off = struct.unpack('L', self.kcore.read(8))[0]
+
+            self.kcore.seek(first + ent_size * i + 0x10)
+            vma = struct.unpack('L', self.kcore.read(8))[0]
+
+            self.kcore.seek(first + ent_size * i + 0x20)
+            len = struct.unpack('L', self.kcore.read(8))[0]
+
+            self.segs.append({
+                'off': off,
+                'vma': vma,
+                'len': len,
+            })
+            debug("     0x%x ~ 0x%x @ 0x%x" % (vma, vma + len, off))
+
 
     def read(self, addr, size):
         off = None
@@ -927,7 +943,6 @@ class KernelMem(object):
         if not off:
             raise Exception(
                 "invalid virtual address 0x%x~0x%x" % (addr, addr + size))
-
         self.kcore.seek(off)
         return self.kcore.read(size)
 
@@ -1256,19 +1271,38 @@ class Parser(object):
                 "expect symbol, number or expression, but get '%s'" % token)
 
 
+class KernelSym(object):
+    def __init__(self):
+        with open('/proc/kallsyms', 'r') as f:
+            self.data = f.read()
+
+    def __call__(self, name):
+        try:
+            addr = re.search(
+                r'(^|\n)(\w+)\s+\w+\s+' + name + r'($|\s|\n)',
+                self.data).group(2)
+            return int('0x' + addr, base=0)
+        except Exception as e:
+            append_err(e, "failed to get address of symbol '%s': " % name)
+            reraise(*sys.exc_info())
+
+
 class Dumper(object):
     BLANK = '    '
 
-    def __init__(self, fmt=FormatOpt(), mem_reader=KernelMem(),
+    def __init__(self, fmt=None, mem_reader=None, sym_searcher=None,
                  btf_path=DEFAULT_BTF_PATH, cache_dir=DEFAULT_CACHE_DIR):
-        self.mem_reader = mem_reader
+        self.sym_searcher = sym_searcher or KernelSym()
+        self.mem_reader = mem_reader or KernelMem()
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
         path_list = btf_path if isinstance(btf_path, list) else [btf_path]
-        self.btfs = [BTF(path, mem_reader=mem_reader,
-                         fmt=fmt, cache_dir=cache_dir) for path in path_list]
+        self.btfs = [BTF(path, mem_reader=self.mem_reader,
+                         fmt=(fmt or FormatOpt()),
+                         cache_dir=cache_dir)
+                    for path in path_list]
 
     @log_call
     def dereference_addr(self, address):
@@ -1308,22 +1342,10 @@ class Dumper(object):
         for idx in typecast.indexes:
             type = Array(type.btf, '', type, idx)
 
-        for i in range(typecast.ref_level):
+        for _ in range(typecast.ref_level):
             type = Ptr(type.btf, '', type)
 
         return type
-
-    @staticmethod
-    @log_call
-    def get_symbol_addr(name):
-        try:
-            output = subprocess.check_output(
-                "cat /proc/kallsyms | grep -w %s | awk '{print $1}'" % name,
-                shell=True).decode()
-            return int('0x' + output, base=0)
-        except Exception as e:
-            append_err(e, "failed to get address of symbol '%s': " % name)
-            reraise(*sys.exc_info())
 
     @log_call
     def get_addr_type(self, expr):
@@ -1396,7 +1418,7 @@ class Dumper(object):
             return addr + type.size * expr.index, type
 
         elif isinstance(expr, Symbol):
-            return self.get_symbol_addr(expr.value), None
+            return self.sym_searcher(expr.value), None
 
         elif isinstance(expr, Number):
             return expr.value, None
@@ -1481,11 +1503,12 @@ def do_dump(dumper, expression_list, watch_interval=None):
         sys.stdout.flush()
         time.sleep(watch_interval)
 
+
 def show_netdev(dumper):
-    for dev in iter(dumper.list(
-        '((struct net) init_net).dev_base_head.next',
-        'struct net_device', 'dev_list')):
+    for dev in dumper.list('((struct net) init_net).dev_base_head.next',
+            'struct net_device', 'dev_list'):
         print("%s @ 0x%x" % (dev.name, dev.addr))
+
 
 if __name__ == '__main__':
     epilog = """examples:
