@@ -373,7 +373,7 @@ class BTFType(object):
 
 
 @BTF.register_type(BTF.KIND_VOID)
-class Int(BTFType):
+class Void(BTFType):
     def __init__(self, btf, name):
         self.btf = btf
         self.name = name
@@ -1417,6 +1417,20 @@ class Dumper(object):
         value = self.eval(expr)
         return "%s = %s;" % (expr, str(value))
 
+    def list(self, first, type, member):
+        if isinstance(first, str):
+            first = self.eval(first)
+
+        if isinstance(type, str):
+            type = self.get_type(type)
+
+        pos = first
+        while int(pos) and int(pos) != first.addr:
+            addr = int(pos) - type.get(member).offset
+            value = type(addr=addr)
+            pos = pos.next
+            yield value
+
 
 def do_dump(dumper, expression_list, watch_interval=None):
     expr_list = []
@@ -1468,13 +1482,10 @@ def do_dump(dumper, expression_list, watch_interval=None):
         time.sleep(watch_interval)
 
 def show_netdev(dumper):
-    dev_type = dumper.get_type('struct net_device')
-    dev_head = dumper.eval('((struct net) init_net).dev_base_head')
-    next = dev_head.next
-    while int(next) != dev_head.addr:
-        dev = dev_type(addr=(int(next) - dev_type.dev_list.offset))
+    for dev in iter(dumper.list(
+        '((struct net) init_net).dev_base_head.next',
+        'struct net_device', 'dev_list')):
         print("%s @ 0x%x" % (dev.name, dev.addr))
-        next = next.next
 
 if __name__ == '__main__':
     epilog = """examples:
