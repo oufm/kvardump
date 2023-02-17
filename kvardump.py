@@ -172,7 +172,7 @@ class BTF(object):
         return len(self.offsets)
 
     @classmethod
-    def register_type(cls, kind):
+    def register_kind(cls, kind):
         def _decorator(target):
             target.KIND = kind
             cls.TYPE_MAP[kind] = target
@@ -371,7 +371,7 @@ class BTFType(object):
         return self.KIND == kind
 
 
-@BTF.register_type(BTF.KIND_VOID)
+@BTF.register_kind(BTF.KIND_VOID)
 class Void(BTFType):
     def __init__(self, btf, name):
         self.btf = btf
@@ -382,7 +382,7 @@ class Void(BTFType):
         return cls(btf, name)
 
 
-@BTF.register_type(BTF.KIND_INT)
+@BTF.register_kind(BTF.KIND_INT)
 class Int(BTFType):
     def __init__(self, btf, name, size, signed=False, char=False,
                  bool=False, offset=0, bits=0):
@@ -451,7 +451,7 @@ class Ref(BTFType):
         return cls(btf, name, type)
 
 
-@BTF.register_type(BTF.KIND_PTR)
+@BTF.register_kind(BTF.KIND_PTR)
 class Ptr(Ref):
     def __str__(self):
         return "%s *" % str(self.ref)
@@ -527,30 +527,30 @@ class Bedeck(Ref):
             return self.ref.to_str(indent)
 
 
-@BTF.register_type(BTF.KIND_TYPEDEF)
+@BTF.register_kind(BTF.KIND_TYPEDEF)
 class TypeDef(Bedeck):
     pass
 
 
-@BTF.register_type(BTF.KIND_VOLATILE)
+@BTF.register_kind(BTF.KIND_VOLATILE)
 class Volatile(Bedeck):
     def __str__(self):
         return "volatile %s" % str(self.ref)
 
 
-@BTF.register_type(BTF.KIND_CONST)
+@BTF.register_kind(BTF.KIND_CONST)
 class Const(Bedeck):
     def __str__(self):
         return "const %s" % str(self.ref)
 
 
-@BTF.register_type(BTF.KIND_RESTRICT)
+@BTF.register_kind(BTF.KIND_RESTRICT)
 class Restrict(Bedeck):
     def __str__(self):
         return "restrict %s" % str(self.ref)
 
 
-@BTF.register_type(BTF.KIND_ARRAY)
+@BTF.register_kind(BTF.KIND_ARRAY)
 class Array(BTFType):
     def __init__(self, btf, name, type, nelems):
         self.btf = btf
@@ -752,19 +752,19 @@ class StructUnion(BTFType):
             return txt
 
 
-@BTF.register_type(BTF.KIND_STRUCT)
+@BTF.register_kind(BTF.KIND_STRUCT)
 class Struct(StructUnion):
     def __str__(self):
         return "struct %s" % str(self.name)
 
 
-@BTF.register_type(BTF.KIND_UNION)
+@BTF.register_kind(BTF.KIND_UNION)
 class Union(StructUnion):
     def __str__(self):
         return "union %s" % str(self.name)
 
 
-@BTF.register_type(BTF.KIND_ENUM)
+@BTF.register_kind(BTF.KIND_ENUM)
 class Enum(Int):
     class Member(BTFType):
         def __init__(self, parent, btf, name, val):
@@ -814,7 +814,7 @@ class Enum(Int):
             return super(self.__class__, self).to_str(indent)
 
 
-@BTF.register_type(BTF.KIND_FWD)
+@BTF.register_kind(BTF.KIND_FWD)
 class Fwd(BTFType):
     def __init__(self, btf, name, kind_flag):
         self.btf = btf
@@ -832,7 +832,7 @@ class Fwd(BTFType):
         return cls(btf, name, kind_flag)
 
 
-@BTF.register_type(BTF.KIND_FUNC_PROTO)
+@BTF.register_kind(BTF.KIND_FUNC_PROTO)
 class FuncProto(BTFType):
     def __init__(self, btf, name, vlen, type):
         self.btf = btf
@@ -860,12 +860,12 @@ class FuncProto(BTFType):
             return '0x%x' % int(self)
 
 
-@BTF.register_type(BTF.KIND_FUNC)
+@BTF.register_kind(BTF.KIND_FUNC)
 class Func(Ref):
     pass
 
 
-@BTF.register_type(BTF.KIND_VAR)
+@BTF.register_kind(BTF.KIND_VAR)
 class Var(BTFType):
     def __init__(self, btf, name, type):
         self.btf = btf
@@ -878,7 +878,7 @@ class Var(BTFType):
         return cls(btf, name, type)
 
 
-@BTF.register_type(BTF.KIND_DATASEC)
+@BTF.register_kind(BTF.KIND_DATASEC)
 class DataSec(BTFType):
     def __init__(self, btf, name, vlen, size):
         self.btf = btf
@@ -1288,7 +1288,62 @@ class KernelSym(object):
 
 
 class Dumper(object):
-    BLANK = '    '
+    HELP = """
+    value = dumper.eval(expression)
+        Evaluate the expression, and return the value.
+
+        expression: rvalue expression in C style. '.', '->', '[]', '()' and typecast are supported.
+                    e.g.: '((struct net)init_net).ipv4.fib_main->tb_data'
+        value: a variable instance, could be a number, array, pointer, struct, or their complexes.
+
+    print(str(value))
+        Pretty print the value.
+
+    addr = value.addr
+        Get the address of the value.
+
+    type = value.type
+        Get the type of the value.
+
+    size = value.type.size
+        Get the size of the value.
+
+    type = dumper.get_type(type_str)
+        Get the type from string.
+        type_str: a string to descript the type.
+                  e.g.: 'struct net_device*'
+
+    value = type(addr=addr)
+        Get the value with specified type and address.
+
+    number = int(value) if isintance(value, Int.Value) else None
+        Get the number from the Int value.
+
+    address = int(value) if isintance(value, Ptr.Value) else None
+        Get the address where the pointer refers to.
+
+    value = value.value if isintance(value, Ptr.Value) else None
+        Get the value where the pointer refers to.
+
+    value = value[0] if isintance(value, Array.Value) else None
+        Get the first element of the array.
+
+    value = value.member_name if insintance(value, Struct.Value) else None
+    assert value == (value.get('member_name') if insintance(value, Struct.Value) else None)
+        Get the member of the struct.
+
+    values = [ m for m in value ] if insintance(value, Struct.Value) else []
+        Get all the members of the struct.
+
+    offset = value.type.member_name.offset if insintance(value, Struct.Value) else None
+    assert offset == (value.type.get('member_name').offset if insintance(value, Struct.Value) else None)
+        Get offset of the member.
+
+    values = [ v for v in dumper.list(first_node_value_or_str, container_type_or_str, list_member_str)]
+        Iterate a list or hlist.
+        e.g.:
+            print(dev.name) for dev in dumper.list('((struct net) init_net).dev_base_head.next', 'struct net_device', 'dev_list')
+    """
 
     def __init__(self, fmt=None, mem_reader=None, sym_searcher=None,
                  btf_path=DEFAULT_BTF_PATH, cache_dir=DEFAULT_CACHE_DIR):
@@ -1453,6 +1508,11 @@ class Dumper(object):
             pos = pos.next
             yield value
 
+    def show_netdev(self):
+        for dev in self.list('((struct net) init_net).dev_base_head.next',
+                'struct net_device', 'dev_list'):
+            print("%s @ 0x%x" % (dev.name, dev.addr))
+
 
 def do_dump(dumper, expression_list, watch_interval=None):
     expr_list = []
@@ -1504,12 +1564,6 @@ def do_dump(dumper, expression_list, watch_interval=None):
         time.sleep(watch_interval)
 
 
-def show_netdev(dumper):
-    for dev in dumper.list('((struct net) init_net).dev_base_head.next',
-            'struct net_device', 'dev_list'):
-        print("%s @ 0x%x" % (dev.name, dev.addr))
-
-
 if __name__ == '__main__':
     epilog = """examples:
     * dump the kernel init_net structure:
@@ -1518,12 +1572,14 @@ if __name__ == '__main__':
         %(prog)s netdev
     * dump net device at specified address:
         %(prog)s '(struct net_device)0xffff8d4260214000'
+    * entry interactive shell:
+        python -i %(prog)s -t ./vmlinux.btf
     """ % {'prog': sys.argv[0]}
     parser = argparse.ArgumentParser(
         description='Dump global variables of kernel.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog)
-    parser.add_argument('expression', type=str, nargs='+',
+    parser.add_argument('expression', type=str, nargs='*',
                         help='rvalue expression in C style with typecast, ' + 
                         'or "netdev" to list net devices')
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -1560,8 +1616,14 @@ if __name__ == '__main__':
     try:
         dumper = Dumper(btf_path=args.btf_paths.split(','),
                         fmt=fmt, cache_dir=args.cache_dir)
-        if len(args.expression) == 1 and args.expression[0] in ('netdev', 'net'):
-            show_netdev(dumper)
+        if not args.expression:
+            if not sys.flags.interactive:
+                parser.print_help()
+                raise Exception("expression should be specified")
+            else:
+                print("type 'print(dumper.HELP)' to see help message")
+        elif len(args.expression) == 1 and args.expression[0] in ('netdev', 'net'):
+            dumper.show_netdev()
         else:
             do_dump(dumper, args.expression, args.watch_interval)
     except Exception as e:
