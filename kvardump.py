@@ -148,8 +148,8 @@ class BTF(object):
 
         self.open_btf()
 
-        cache_path = os.path.join(
-            cache_dir, os.path.basename(btf_path)) if cache_dir else None
+        cache_path = (os.path.join(cache_dir, os.path.basename(btf_path)) +
+                        '.btfcache') if cache_dir else None
         if cache_path:
             try:
                 if os.path.exists(cache_path):
@@ -313,7 +313,7 @@ class BTF(object):
 class BaseValue(object):
     def __init__(self, type, data=None, addr=None):
         if not data and not addr:
-            raise Exception("both data add addr are not specified")
+            raise Exception("both data and addr are not specified")
 
         self.type = type
         self.btf = type.btf
@@ -336,13 +336,24 @@ class BaseValue(object):
             reraise(Exception, msg, sys.exc_info()[2])
         return self._data
 
+    @property
+    def pointer(self):
+        if self.addr is None:
+            raise Exception("unknown address of %s" % repr(self))
+
+        type = Ptr(self.btf, '', self.type)
+        return type(data=struct.pack('P', self.addr))
+
     def to_str(self, indent=0):
         raise NotImplementedError()
 
     def cast(self, type):
-        if not self.addr:
-            raise Exception("address of '%s' has not been set" % repr(self))
-        return type(addr=self.addr)
+        if self.addr:
+            return type(addr=self.addr)
+        elif type.size <= len(self.data):
+            return type(data=self.data[:type.size])
+
+        raise Exception("unknown address of '%s'" % repr(self))
 
 
 class BTFType(object):
@@ -478,6 +489,16 @@ class Ptr(Ref):
 
         def __getattr__(self, name):
             return getattr(self.value, name)
+
+        def __add__(self, num):
+            addr = int(self)
+            addr += (int(num) * self.type.ref.size)
+            return self.type(data=struct.pack('P', addr))
+
+        def __sub__(self, num):
+            addr = int(self)
+            addr -= (int(num) * self.type.ref.size)
+            return self.type(data=struct.pack('P', addr))
 
         @property
         def value(self):
@@ -731,7 +752,6 @@ class StructUnion(BTFType):
 
         def _get(self, member):
             addr = self.addr + member.offset if self.addr else None
-            # TODO member.ref.size or member.size ?
             data = self.data[member.offset : member.offset + member.ref.size]
             return member.ref(data=data, addr=addr)
 
@@ -1293,8 +1313,8 @@ class KernelSym(object):
 
 
 class ElfSym(object):
-    def __init__(self, pid):
-        elf_path = os.readlink(os.path.join('/proc', str(pid), 'exe'))
+    def __init__(self, pid, elf_path=None):
+        elf_path = elf_path or os.readlink(os.path.join('/proc', str(pid), 'exe'))
         if not os.access(elf_path, os.R_OK):
             raise Exception("can't read '%s'")
 
@@ -1313,23 +1333,12 @@ class ElfSym(object):
         # Open the ELF file
         with open(path, "rb") as f:
             # Read the ELF file header
-            # f.seek(0)
-            # elfhdr = f.read(52)
-            # Unpack the header fields using struct
-            # elf_ident = struct.unpack("16s", elfhdr[0:16])
-            # elf_type = struct.unpack("H", elfhdr[16:18])
-            # elf_machine = struct.unpack("H", elfhdr[18:20])
-            # elf_version = struct.unpack("I", elfhdr[20:24])
-            # elf_entry = struct.unpack("Q", elfhdr[24:32])
-            # elf_phoff = struct.unpack("Q", elfhdr[32:40])
             f.seek(40)
             elf_shoff = struct.unpack("Q", f.read(8))[0]
             f.seek(60)
             elf_shnum = struct.unpack("H", f.read(2))[0]
             f.seek(62)
             elf_shstrndx = struct.unpack("H", f.read(2))[0]
-
-            # elf_flags = struct.unpack("I", elfhdr[48:52])
 
             # Find the symbol table and string table
             symtab_offset = 0
@@ -1425,6 +1434,11 @@ class Dumper(object):
     value = value.value if isintance(value, Ptr.Value) else None
         Get the value where the pointer refers to.
 
+    ptr = value.pointer
+    assert isinstance(ptr, Ptr.Value)
+    assert ptr.value.addr == value.addr
+        Get a pointer which refers to the value.
+
     value = value[0] if isintance(value, Array.Value) else None
         Get the first element of the array.
 
@@ -1439,7 +1453,7 @@ class Dumper(object):
     assert offset == (value.type.get('member_name').offset if insintance(value, Struct.Value) else None)
         Get the offset of the member.
 
-    values = [ v for v in dumper.list(first_node_value_or_str, container_type_or_str, list_member_str)]
+    values = [ v for v in dumper.list(first_ptr_or_str, container_type_or_str, list_member_str)]
         Iterate a list or hlist.
         e.g.:
             print(dev.name) for dev in dumper.list('((struct net) init_net).dev_base_head.next', 'struct net_device', 'dev_list')
@@ -1490,7 +1504,7 @@ class Dumper(object):
                         continue
             break
 
-        if not type:
+        if type is None:
             raise Exception(
                 "can't find type %s %s" % (typecast.keyword, typecast.new_type))
 
@@ -1510,7 +1524,7 @@ class Dumper(object):
 
         elif isinstance(expr, Access):
             addr, type = self.get_addr_type(expr.variable)
-            if not type:
+            if type is None:
                 raise Exception("type of '%s' is unknown" % expr.variable)
 
             if not type.is_kind(BTF.KIND_STRUCT) and \
@@ -1523,7 +1537,7 @@ class Dumper(object):
 
         elif isinstance(expr, Dereference):
             addr, type = self.get_addr_type(expr.variable)
-            if not type:
+            if type is None:
                 raise Exception("type of '%s' is unknown" % expr.variable)
             if type.is_kind(BTF.KIND_ARRAY):
                 raise Exception("type of '%s' is '%s', which is an array, "
@@ -1556,7 +1570,7 @@ class Dumper(object):
 
         elif isinstance(expr, Index):
             addr, type = self.get_addr_type(expr.variable)
-            if not type:
+            if type is None:
                 raise Exception("type of '%s' is not specified" %
                                 expr.variable)
             if not type.is_kind(BTF.KIND_ARRAY) and \
@@ -1565,11 +1579,11 @@ class Dumper(object):
                                 "nor array, index is not allowed" %
                                 (expr.variable, type))
 
-            type = type.ref
             if type.is_kind(BTF.KIND_PTR):
                 # index a pointer instead of array
                 addr = self.dereference_addr(addr)
 
+            type = type.ref
             return addr + type.size * expr.index, type
 
         elif isinstance(expr, Symbol):
@@ -1585,7 +1599,7 @@ class Dumper(object):
             expr = Parser(Lexer(expr)).parse()
 
         addr, type = self.get_addr_type(expr)
-        if not type:
+        if type is None:
             raise Exception("type of '%s' is not specified" % expr)
 
         return type(addr=addr)
@@ -1594,15 +1608,15 @@ class Dumper(object):
         value = self.eval(expr)
         return "%s = %s;" % (expr, str(value))
 
-    def list(self, first, type, member):
-        if isinstance(first, str):
-            first = self.eval(first)
+    def list(self, first_ptr, type, member):
+        if isinstance(first_ptr, str):
+            first_ptr = self.eval(first_ptr)
 
         if isinstance(type, str):
             type = self.get_type(type)
 
-        pos = first
-        while int(pos) and int(pos) != first.addr:
+        pos = first_ptr
+        while int(pos) and int(pos) != first_ptr.addr:
             addr = int(pos) - type.get(member).offset
             value = type(addr=addr)
             pos = pos.next
@@ -1666,28 +1680,42 @@ def do_dump(dumper, expression_list, watch_interval=None):
 
 if __name__ == '__main__':
     epilog = """examples:
-    * dump the kernel init_net structure:
-        %(prog)s '(struct net) init_net'
+    * dump the structure in process 'prog' which 'var' refers to:
+        %(prog)s -p `pidof prog` -t ./prog.btf '*(struct foo *)var'
+    * dump the header of kernel route table:
+        %(prog)s '*((struct net)init_net).ipv4.route_hdr'
     * list net devices:
         %(prog)s netdev
-    * dump net device at specified address:
+    * dump the net device at specified address:
         %(prog)s '(struct net_device)0xffff8d4260214000'
-    * entry interactive shell:
+    * enter interactive shell:
         python -i %(prog)s -t ./vmlinux.btf
+    * list net namespaces:
+        python -c "from kvardump import *; print([str(net.ns.inum) for net in Dumper().list('((struct list_head)net_namespace_list).next', 'struct net', 'list')])"
     """ % {'prog': sys.argv[0]}
     parser = argparse.ArgumentParser(
-        description='Dump global variables of kernel.',
+        description='Dump global variables in kernel or a process.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog)
     parser.add_argument('expression', type=str, nargs='*',
-                        help='rvalue expression in C style with typecast, ' + 
+                        help='rvalue expression in C style with typecast, '
                         'or "netdev" to list net devices')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='show debug information')
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='suppress log')
     parser.add_argument('-p', '--pid', type=int,
-                        help='target process ID, or kernel if not specified')
+                        help='target process ID, '
+                            'dump variables in kernel if pid is not specified')
+    parser.add_argument('-e', '--elf-path',
+                        help='elf path to read symbols, '
+                             '`readlink /proc/$pid/exe` by default')
+    parser.add_argument('-t', '--btf-paths', type=str,
+                        help='BTF paths, separated by ",", '
+                        '%s by default.' % DEFAULT_BTF_PATH)
+    parser.add_argument('-c', '--cache-dir', type=str,
+                        help='directory to save cache, set empty to disable cache',
+                        default=DEFAULT_CACHE_DIR)
     parser.add_argument('-x', '--hex-string', action='store_true',
                         help='dump byte array in hex instead of string')
     parser.add_argument('-a', '--array-max', type=int, default=0,
@@ -1697,11 +1725,6 @@ if __name__ == '__main__':
     parser.add_argument('-w', '--watch-interval', type=float,
                         help='check the expression value every WATCH_INTERVAL '
                              'seconds and dump it when it changes')
-    parser.add_argument('-t', '--btf-paths', type=str,
-                        help='BTF paths, separated by ","')
-    parser.add_argument('-c', '--cache-dir', type=str,
-                        help='directory to save cache, set empty to disable cache',
-                        default=DEFAULT_CACHE_DIR)
     args = parser.parse_args()
 
     verbose = args.verbose
@@ -1716,7 +1739,7 @@ if __name__ == '__main__':
 
     try:
         if args.pid:
-            sym_searcher = ElfSym(args.pid)
+            sym_searcher = ElfSym(args.pid, elf_path=args.elf_path)
             mem_reader = ProcMem(args.pid)
             if not args.btf_paths:
                 raise Exception("BTF path must be specified")
