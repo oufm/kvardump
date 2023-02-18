@@ -41,7 +41,7 @@ For example:
 ```bash
 ./kvardump.py 'init_net' # Fail
 ./kvardump.py '(struct net) init_net' # OK
-./kvardump.py '(struct net_device) 0x0xffff8d4260214000' # OK'
+./kvardump.py '*(struct net_device*) 0x0xffff8d4260214000' # OK'
 ```
 
 kvardump reads variables in the kernel by default, but `-p` can be specified to read process variables.

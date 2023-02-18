@@ -256,7 +256,7 @@ class BTF(object):
         kind_flag = info >> 31
         name = self.offset2name(name_off)
         cls = self.TYPE_MAP[kind]
-        ext_size = cls.btf_ext_size(type)
+        ext_size = cls.btf_ext_size(vlen)
         bpf_type = cls.from_btf(
             self, name, size, type, vlen, kind_flag, self.eat(ext_size))
         return bpf_type
@@ -1518,25 +1518,16 @@ class Dumper(object):
     def __init__(self, fmt=None, mem_reader=None, sym_searcher=None,
                  btf_path=DEFAULT_BTF_PATH, cache_dir=DEFAULT_CACHE_DIR):
         self.sym_searcher = sym_searcher or KernelSym()
-        self.mem_reader = mem_reader or CoreMem()
+        mem_reader = mem_reader or CoreMem()
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
         path_list = btf_path if isinstance(btf_path, list) else [btf_path]
-        self.btfs = [BTF(path, mem_reader=self.mem_reader,
+        self.btfs = [BTF(path, mem_reader=mem_reader,
                          fmt=(fmt or FormatOpt()),
                          cache_dir=cache_dir)
                     for path in path_list]
-
-    @log_call
-    def dereference_addr(self, address):
-        try:
-            data = self.mem_reader.read(address, self.arch_size)
-        except Exception:
-            raise Exception("read at address 0x%x failed" % address)
-
-        return struct.unpack('P', data)[0]
 
     @log_call
     def get_type(self, typecast):
@@ -1573,129 +1564,26 @@ class Dumper(object):
         return type
 
     @log_call
-    def get_addr_type(self, expr):
-        if isinstance(expr, Typecast):
-            addr, _ = self.get_addr_type(expr.variable)
-            return addr, self.get_type(expr)
-
-        elif isinstance(expr, Access):
-            addr, type = self.get_addr_type(expr.variable)
-            if type is None:
-                raise Exception("type of '%s' is unknown" % expr.variable)
-
-            if not type.is_kind(BTF.KIND_STRUCT) and \
-                not type.is_kind(BTF.KIND_UNION):
-                raise Exception("type of '%s' is '%s', neither struct nor union, "
-                                "'.' is not allowed" % (expr.variable, type))
-
-            member = type.get(expr.member)
-            return addr + (member.offset), member.ref
-
-        elif isinstance(expr, Dereference):
-            addr, type = self.get_addr_type(expr.variable)
-            if type is None:
-                raise Exception("type of '%s' is unknown" % expr.variable)
-            if type.is_kind(BTF.KIND_ARRAY):
-                raise Exception("type of '%s' is '%s', which is an array, "
-                                "not a pointer, '%s' is not allowed" %
-                                (expr.variable, type,
-                                 '->' if expr.member else '*'))
-            if type.is_kind(BTF.KIND_STRUCT) or type.is_kind(BTF.KIND_UNION):
-                if expr.member:
-                    raise Exception("type of '%s' is '%s', '.' "
-                                    "should be used instead of '->'" %
-                                    (expr.variable, type))
-            if not type.is_kind(BTF.KIND_PTR):
-                raise Exception("type of '%s' is '%s', not a pointer, "
-                                "'%s' is not allowed" %
-                                (expr.variable, type,
-                                '->' if expr.member else '*'))
-            type = type.ref
-            addr = self.dereference_addr(addr)
-            offset = 0
-            if expr.member:
-                if not type.is_kind(BTF.KIND_STRUCT) and \
-                    not type.is_kind(BTF.KIND_UNION):
-                    raise Exception("type of '*%s' is '%s', neither struct nor union, "
-                                    "'->' is not allowed" %
-                                    (expr.variable, type))
-                type = type.get(expr.member)
-                offset = type.offset
-                type = type.ref
-            return addr + offset, type
-
-        elif isinstance(expr, Index):
-            addr, type = self.get_addr_type(expr.variable)
-            if type is None:
-                raise Exception("type of '%s' is not specified" %
-                                expr.variable)
-            if not type.is_kind(BTF.KIND_ARRAY) and \
-                not type.is_kind(BTF.KIND_PTR):
-                raise Exception("type of '%s' is '%s', neither pointer "
-                                "nor array, index is not allowed" %
-                                (expr.variable, type))
-
-            if type.is_kind(BTF.KIND_PTR):
-                # index a pointer instead of array
-                addr = self.dereference_addr(addr)
-
-            type = type.ref
-            return addr + type.size * expr.index, type
-
-        elif isinstance(expr, Symbol):
-            return self.sym_searcher(expr.value), None
-
-        elif isinstance(expr, Number):
-            return expr.value, None
-
-        raise Exception("unsupported expression: %s" % expr)
-
-    @log_call
     def _eval(self, expr):
         if isinstance(expr, Typecast):
             return self._eval(expr.variable).cast(self.get_type(expr))
-            # addr, _ = self.get_addr_type(expr.variable)
-            # return addr, self.get_type(expr)
 
         elif isinstance(expr, Access):
             val = self._eval(expr.variable)
-            # addr, type = self.get_addr_type(expr.variable)
-            # if type is None:
-            #     raise Exception("type of '%s' is unknown" % expr.variable)
-
             if not val.type.is_kind(BTF.KIND_STRUCT) and \
                 not val.type.is_kind(BTF.KIND_UNION):
                 raise Exception("type of '%s' is '%s', neither struct nor union, "
                                 "'.' is not allowed" % (expr.variable, val.type))
-
             return val.get(expr.member)
-            # member = type.get(expr.member)
-            # return addr + (member.offset), member.ref
 
         elif isinstance(expr, Dereference):
             val = self._eval(expr.variable)
-            # addr, type = self.get_addr_type(expr.variable)
-            # if type is None:
-            #     raise Exception("type of '%s' is unknown" % expr.variable)
-            # if val.type.is_kind(BTF.KIND_ARRAY):
-            #     raise Exception("type of '%s' is '%s', which is an array, "
-            #                     "not a pointer, '%s' is not allowed" %
-            #                     (expr.variable, val.type,
-            #                      '->' if expr.member else '*'))
-            # if val.type.is_kind(BTF.KIND_STRUCT) or val.type.is_kind(BTF.KIND_UNION):
-            #     if expr.member:
-            #         raise Exception("type of '%s' is '%s', '.' "
-            #                         "should be used instead of '->'" %
-            #                         (expr.variable, val.type))
             if not val.type.is_kind(BTF.KIND_PTR):
                 raise Exception("type of '%s' is '%s', not a pointer, "
                                 "'%s' is not allowed" %
                                 (expr.variable, val.type,
                                 '->' if expr.member else '*'))
             val = val.value
-            # type = type.ref
-            # addr = self.dereference_addr(addr)
-            # offset = 0
             if expr.member:
                 if not val.type.is_kind(BTF.KIND_STRUCT) and \
                     not val.type.is_kind(BTF.KIND_UNION):
@@ -1703,38 +1591,23 @@ class Dumper(object):
                                     "'->' is not allowed" %
                                     (expr.variable, val.type))
                 val = val.get(expr.member)
-                # type = type.get(expr.member)
-                # offset = type.offset
-                # type = type.ref
             return val
-            # return addr + offset, type
 
         elif isinstance(expr, Index):
             val = self._eval(expr.variable)
-            # addr, type = self.get_addr_type(expr.variable)
-            # if type is None:
-            #     raise Exception("type of '%s' is not specified" %
-            #                     expr.variable)
             if not val.type.is_kind(BTF.KIND_ARRAY) and \
                 not val.type.is_kind(BTF.KIND_PTR):
                 raise Exception("type of '%s' is '%s', neither pointer "
                                 "nor array, index is not allowed" %
                                 (expr.variable, val.type))
-
             if val.type.is_kind(BTF.KIND_PTR):
-                # index a pointer instead of array
                 val = val.value
-                # addr = self.dereference_addr(addr)
-
             return val[expr.index]
-            # type = type.ref
-            # return addr + type.size * expr.index, type
 
         elif isinstance(expr, Symbol):
             addr = self.sym_searcher(expr.value)
             type = Void(self.btfs[0], 'unknown')
             return type(addr=addr)
-            # return self.sym_searcher(expr.value), None
 
         elif isinstance(expr, Number):
             if expr.value < 0:
@@ -1743,7 +1616,6 @@ class Dumper(object):
             else:
                 type = Int(self.btfs[0], 'unsigned long', 8, signed=False)
                 return type(data=struct.pack('Q', expr.value))
-            # return expr.value, None
 
         raise Exception("unsupported expression: %s" % expr)
 
@@ -1753,12 +1625,9 @@ class Dumper(object):
 
         val = self._eval(expr)
         if val.type.is_kind(BTF.KIND_VOID):
-        # addr, type = self.get_addr_type(expr)
-        # if type is None:
             raise Exception("type of '%s' is not unknown" % expr)
 
         return val
-        # return type(addr=addr)
 
     def dump(self, expr):
         value = self.eval(expr)
@@ -1780,6 +1649,9 @@ class Dumper(object):
     def list(self, first_ptr, type, member):
         if isinstance(first_ptr, str):
             first_ptr = self.eval(first_ptr)
+
+        if isinstance(type, str):
+            type = self.get_type(type)
 
         pos = first_ptr
         while int(pos) and int(pos) != first_ptr.addr:
@@ -1852,7 +1724,7 @@ if __name__ == '__main__':
     * list net devices:
         %(prog)s netdev
     * dump the net device at specified address:
-        %(prog)s '(struct net_device)0xffff8d4260214000'
+        %(prog)s '*(struct net_device*)0xffff8d4260214000'
     * enter interactive shell:
         python -i %(prog)s -t ./vmlinux.btf
     * list net namespaces:
