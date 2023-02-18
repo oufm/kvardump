@@ -43,17 +43,17 @@ def append_err(err, txt_before='', txt_after=''):
     err.show_txt = "%s%s%s" % (txt_before, err_txt(err), txt_after)
 
 
-def info(txt):
+def log_info(txt):
     if not quiet:
         print(txt, file=sys.stderr)
 
 
-def debug(txt):
+def log_debug(txt):
     if verbose:
         print(txt, file=sys.stderr)
 
 
-def error(txt):
+def log_error(txt):
     print("Error: %s" % txt, file=sys.stderr)
 
 
@@ -62,7 +62,7 @@ def log_exception():
         return
 
     exc_type, exc_value, exc_traceback = sys.exc_info()
-    error(err_txt(exc_value))
+    log_error(err_txt(exc_value))
     traceback.print_exception(exc_type, exc_value, exc_traceback,
                               file=sys.stderr)
 
@@ -96,7 +96,6 @@ def log_call(func):
                       (log_nest_level, func.__name__, arg_str, ret_str),
                       file=sys.stderr)
         return ret
-
     return _func
 
 
@@ -147,6 +146,7 @@ class BTF(object):
         self.mem_reader = mem_reader
         self.fmt = fmt
 
+        self.id2type = {}
         self.open_btf()
 
         cache_path = (os.path.join(cache_dir, os.path.basename(btf_path)) +
@@ -157,7 +157,7 @@ class BTF(object):
                     self.load_cache(cache_path)
                     return
             except Exception as e:
-                error("load cache from %s failed: %s" % (cache_path, e))
+                log_error("load cache from %s failed: %s" % (cache_path, e))
                 log_exception()
 
         self.parse()
@@ -166,7 +166,7 @@ class BTF(object):
             try:
                 self.save_cache(cache_path)
             except Exception as e:
-                error("save cache to %s failed: %s" % (cache_path, e))
+                log_error("save cache to %s failed: %s" % (cache_path, e))
                 log_exception()
 
     def __getitem__(self, kind_name):
@@ -184,7 +184,7 @@ class BTF(object):
         return _decorator
 
     def load_cache(self, path):
-        info("loading cache from '%s'" % path)
+        log_info("loading cache from '%s'" % path)
 
         with open(path, 'r') as f:
             cache = json.load(f)
@@ -192,10 +192,9 @@ class BTF(object):
                 raise Exception("checksum of '%s' changed" % self.btf_path)
             self.name2id = cache['name2id']
             self.offsets = cache['offsets']
-            self.id2type = {}
 
     def save_cache(self, path):
-        info("writing cache to '%s'" % path)
+        log_info("writing cache to '%s'" % path)
 
         dir = os.path.dirname(path)
         if not os.path.exists(dir):
@@ -257,22 +256,29 @@ class BTF(object):
         kind_flag = info >> 31
         name = self.offset2name(name_off)
         cls = self.TYPE_MAP[kind]
-        type = cls.from_btf(self, name, size, type, vlen, kind_flag)
-        return type
+        ext_size = cls.btf_ext_size(type)
+        bpf_type = cls.from_btf(
+            self, name, size, type, vlen, kind_flag, self.eat(ext_size))
+        return bpf_type
 
     def parse(self):
-        info("parsing types in '%s'" % self.btf_path)
+        log_info("parsing types in '%s'" % self.btf_path)
         self.name2id = {}
         # type ID start from 1
         self.offsets = [None]
-        self.id2type = {}
 
         while self.pos < len(self.type_data):
             id = len(self.offsets)
             self.offsets.append(self.pos)
-            type = self.parse_one()
-            self.name2id["%s.%s" % (type.KIND, type.name)] = id
-            self.id2type[id] = type
+            data = self.eat(8)
+            name_off, info = struct.unpack("II", data)
+            vlen = info & 0xffff
+            kind = (info >> 24) & 0xf
+            name = self.offset2name(name_off)
+            cls = self.TYPE_MAP[kind]
+            ext_size = cls.btf_ext_size(vlen)
+            self.pos += (4 + ext_size)
+            self.name2id["%s.%s" % (cls.KIND, name)] = id
 
     def offset2name(self, offset):
         if offset >= len(self.str_data):
@@ -293,7 +299,6 @@ class BTF(object):
                 raise IndexError("invalid type id %s" % id)
         else:
             key = '%s.%s' % item
-            # key = str(item[0]) + '.' + item[1]
             if key not in self.name2id:
                 if args:
                     return args[0]
@@ -357,19 +362,21 @@ class BaseValue(object):
 
 class BTFType(object):
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         raise NotImplementedError()
+
+    @staticmethod
+    def btf_ext_size(vlen):
+        return 0
 
     def __str__(self):
         if not self.name:
             return repr(self)
-
         return self.name
 
     def __call__(self, data=None, addr=None):
         if isinstance(data, BaseValue):
             return self.Value(self, addr=data.addr)
-
         return self.Value(self, data, addr)
 
     @property
@@ -393,7 +400,7 @@ class Void(BTFType):
         self.name = name
 
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         return cls(btf, name)
 
 
@@ -410,10 +417,13 @@ class Int(BTFType):
         self.offset = offset
         self.bits = bits
 
+    @staticmethod
+    def btf_ext_size(vlen):
+        return 4
+
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
-        data = btf.eat(4)
-        info = struct.unpack("I", data)[0]
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
+        info = struct.unpack("I", ext_data)[0]
         return cls(btf, name, size,
                     signed=(info & 0x01000000) != 0,
                     char=(info & 0x02000000) != 0,
@@ -462,7 +472,7 @@ class Ref(BTFType):
         self.type = type
 
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         return cls(btf, name, type)
 
 
@@ -586,10 +596,13 @@ class Array(BTFType):
     def __str__(self):
         return "%s[%d]" % (str(self.ref), self.nelems)
 
+    @staticmethod
+    def btf_ext_size(vlen):
+        return 12
+
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
-        data = btf.eat(12)
-        info = struct.unpack("III", data)
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
+        info = struct.unpack("III", ext_data)
         return cls(btf, name, info[0], info[2])
 
     @property
@@ -727,12 +740,15 @@ class StructUnion(BTFType):
         else:
             self.member_map[name] = self.members[-1]
 
+    @staticmethod
+    def btf_ext_size(vlen):
+        return 12 * vlen
+
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         obj = cls(btf, name, vlen, size)
-        for _ in range(vlen):
-            data = btf.eat(12)
-            info = struct.unpack("III", data)
+        for i in range(vlen):
+            info = struct.unpack("III", ext_data[12 * i : 12 * (i + 1)])
             obj.add_member(
                 btf.offset2name(info[0]), info[1], info[2] & 0xffffff, info[2] >> 24)
         return obj
@@ -815,12 +831,15 @@ class Enum(Int):
         self.member_map[name] = self.members[-1]
         self.value_map[val] = self.members[-1]
 
+    @staticmethod
+    def btf_ext_size(vlen):
+        return 8 * vlen
+
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         obj = cls(btf, name, vlen, size)
-        for _ in range(vlen):
-            data = btf.eat(8)
-            info = struct.unpack("Ii", data)
+        for i in range(vlen):
+            info = struct.unpack("Ii", ext_data[8 * i : 8 * (i + 1)])
             obj.add_member(btf.offset2name(info[0]), info[1])
         return obj
 
@@ -852,7 +871,7 @@ class Fwd(BTFType):
             return "struct %s" % self.name
 
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         return cls(btf, name, kind_flag)
 
 
@@ -867,9 +886,12 @@ class FuncProto(BTFType):
     def __str__(self):
         return "%s (*%s)(...)" % str(self.ref, self.name)
 
+    @staticmethod
+    def btf_ext_size(vlen):
+        return 8 * vlen
+
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
-        btf.eat(vlen * 8)
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         return cls(btf, name, vlen, type)
 
     @property
@@ -896,9 +918,12 @@ class Var(BTFType):
         self.name = name
         self.type = type
 
+    @staticmethod
+    def btf_ext_size(vlen):
+        return 4
+
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
-        btf.eat(4)
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         return cls(btf, name, type)
 
 
@@ -910,9 +935,12 @@ class DataSec(BTFType):
         self.vlen = vlen
         self.size = size
 
+    @staticmethod
+    def btf_ext_size(vlen):
+        return 12 * vlen
+
     @classmethod
-    def from_btf(cls, btf, name, size, type, vlen, kind_flag):
-        btf.eat(12 * vlen)
+    def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         return cls(btf, name, vlen, size)
 
 
@@ -1256,7 +1284,7 @@ class CoreMem(object):
         self.kcore.seek(0x38)
         count = struct.unpack('H', self.kcore.read(2))[0]
 
-        debug("memory segments: ")
+        log_debug("memory segments: ")
 
         for i in range(count):
             self.kcore.seek(first + ent_size * i + 0)
@@ -1278,7 +1306,7 @@ class CoreMem(object):
                 'vma': vma,
                 'len': len,
             })
-            debug("     0x%x ~ 0x%x @ 0x%x" % (vma, vma + len, off))
+            log_debug("     0x%x ~ 0x%x @ 0x%x" % (vma, vma + len, off))
 
 
     def read(self, addr, size):
@@ -1329,7 +1357,7 @@ class ElfSym(object):
     def read_symbols(self, path):
         self.symbols = {}
 
-        info("reading symbols in '%s'" % path)
+        log_info("reading symbols in '%s'" % path)
         # Open the ELF file
         with open(path, "rb") as f:
             # Read the ELF file header
@@ -1773,7 +1801,7 @@ if __name__ == '__main__':
         else:
             do_dump(dumper, args.expression, args.watch_interval)
     except Exception as e:
-        error("%s" % err_txt(e))
+        log_error("%s" % err_txt(e))
         if verbose:
             reraise(*sys.exc_info())
         exit(1)
