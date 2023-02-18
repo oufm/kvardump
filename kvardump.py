@@ -86,8 +86,13 @@ def log_call(func):
                     arg_str = arg_str1 + ', ' + arg_str2
                 else:
                     arg_str = arg_str1 + arg_str2
+                if isinstance(ret, tuple):
+                    ret_str = ', '.join([str(i) for i in ret])
+                    ret_str = '(%s)' % ret_str
+                else:
+                    ret_str = str(ret)
                 print("call[%d]: %s(%s) = '%s'" %
-                      (log_nest_level, func.__name__, arg_str, str(ret)),
+                      (log_nest_level, func.__name__, arg_str, ret_str),
                       file=sys.stderr)
         return ret
 
@@ -425,9 +430,9 @@ class Int(BTFType):
                     val = struct.unpack('I', self.data)[0]
             elif self.type.size == 8:
                 if self.type.signed:
-                    val = struct.unpack('l', self.data)[0]
+                    val = struct.unpack('q', self.data)[0]
                 else:
-                    val = struct.unpack('L', self.data)[0]
+                    val = struct.unpack('Q', self.data)[0]
             else:
                 raise Exception("invalid int size: %s", self.type.size)
 
@@ -892,61 +897,6 @@ class DataSec(BTFType):
         return cls(btf, name, vlen, size)
 
 
-class KernelMem(object):
-    def __init__(self):
-        self.segs = []
-        self.kcore = open('/proc/kcore', 'rb')
-        self.load_segs()
-
-    def load_segs(self):
-        self.kcore.seek(0x20)
-        first = struct.unpack('L', self.kcore.read(8))[0]
-
-        self.kcore.seek(0x36)
-        ent_size = struct.unpack('H', self.kcore.read(2))[0]
-
-        self.kcore.seek(0x38)
-        count = struct.unpack('H', self.kcore.read(2))[0]
-
-        debug("memory segments: ")
-
-        for i in range(count):
-            self.kcore.seek(first + ent_size * i + 0)
-            type = struct.unpack('I', self.kcore.read(4))[0]
-            if type != 1:
-                continue
-
-            self.kcore.seek(first + ent_size * i + 0x8)
-            off = struct.unpack('L', self.kcore.read(8))[0]
-
-            self.kcore.seek(first + ent_size * i + 0x10)
-            vma = struct.unpack('L', self.kcore.read(8))[0]
-
-            self.kcore.seek(first + ent_size * i + 0x20)
-            len = struct.unpack('L', self.kcore.read(8))[0]
-
-            self.segs.append({
-                'off': off,
-                'vma': vma,
-                'len': len,
-            })
-            debug("     0x%x ~ 0x%x @ 0x%x" % (vma, vma + len, off))
-
-
-    def read(self, addr, size):
-        off = None
-        for s in self.segs:
-            if addr >= s['vma'] and (addr + size) <= s['vma'] + s['len']:
-                off = s['off'] + (addr - s['vma'])
-                break
-
-        if not off:
-            raise Exception(
-                "invalid virtual address 0x%x~0x%x" % (addr, addr + size))
-        self.kcore.seek(off)
-        return self.kcore.read(size)
-
-
 class Token(object):
     pass
 
@@ -1271,6 +1221,61 @@ class Parser(object):
                 "expect symbol, number or expression, but get '%s'" % token)
 
 
+class CoreMem(object):
+    def __init__(self, path='/proc/kcore'):
+        self.segs = []
+        self.kcore = open(path, 'rb')
+        self.load_segs()
+
+    def load_segs(self):
+        self.kcore.seek(0x20)
+        first = struct.unpack('Q', self.kcore.read(8))[0]
+
+        self.kcore.seek(0x36)
+        ent_size = struct.unpack('H', self.kcore.read(2))[0]
+
+        self.kcore.seek(0x38)
+        count = struct.unpack('H', self.kcore.read(2))[0]
+
+        debug("memory segments: ")
+
+        for i in range(count):
+            self.kcore.seek(first + ent_size * i + 0)
+            type = struct.unpack('I', self.kcore.read(4))[0]
+            if type != 1:
+                continue
+
+            self.kcore.seek(first + ent_size * i + 0x8)
+            off = struct.unpack('Q', self.kcore.read(8))[0]
+
+            self.kcore.seek(first + ent_size * i + 0x10)
+            vma = struct.unpack('Q', self.kcore.read(8))[0]
+
+            self.kcore.seek(first + ent_size * i + 0x20)
+            len = struct.unpack('Q', self.kcore.read(8))[0]
+
+            self.segs.append({
+                'off': off,
+                'vma': vma,
+                'len': len,
+            })
+            debug("     0x%x ~ 0x%x @ 0x%x" % (vma, vma + len, off))
+
+
+    def read(self, addr, size):
+        off = None
+        for s in self.segs:
+            if addr >= s['vma'] and (addr + size) <= s['vma'] + s['len']:
+                off = s['off'] + (addr - s['vma'])
+                break
+
+        if not off:
+            raise Exception(
+                "invalid virtual address 0x%x~0x%x" % (addr, addr + size))
+        self.kcore.seek(off)
+        return self.kcore.read(size)
+
+
 class KernelSym(object):
     def __init__(self):
         with open('/proc/kallsyms', 'r') as f:
@@ -1285,6 +1290,101 @@ class KernelSym(object):
         except Exception as e:
             append_err(e, "failed to get address of symbol '%s': " % name)
             reraise(*sys.exc_info())
+
+
+class ElfSym(object):
+    def __init__(self, pid):
+        elf_path = os.readlink(os.path.join('/proc', str(pid), 'exe'))
+        if not os.access(elf_path, os.R_OK):
+            raise Exception("can't read '%s'")
+
+        maps = open(os.path.join('/proc', str(pid), 'maps')).read()
+        self.base_addr = int([line for line in maps.splitlines()
+                              if elf_path in line][0].split('-')[0], base=16)
+        # for non-PIE executable, see: https://stackoverflow.com/a/73189318/18251455
+        if self.base_addr == 0x400000:
+            self.base_addr = 0
+
+        self.read_symbols(elf_path)
+
+    def read_symbols(self, path):
+        self.symbols = {}
+
+        # Open the ELF file
+        with open(path, "rb") as f:
+            # Read the ELF file header
+            # f.seek(0)
+            # elfhdr = f.read(52)
+            # Unpack the header fields using struct
+            # elf_ident = struct.unpack("16s", elfhdr[0:16])
+            # elf_type = struct.unpack("H", elfhdr[16:18])
+            # elf_machine = struct.unpack("H", elfhdr[18:20])
+            # elf_version = struct.unpack("I", elfhdr[20:24])
+            # elf_entry = struct.unpack("Q", elfhdr[24:32])
+            # elf_phoff = struct.unpack("Q", elfhdr[32:40])
+            f.seek(40)
+            elf_shoff = struct.unpack("Q", f.read(8))[0]
+            f.seek(60)
+            elf_shnum = struct.unpack("H", f.read(2))[0]
+            f.seek(62)
+            elf_shstrndx = struct.unpack("H", f.read(2))[0]
+
+            # elf_flags = struct.unpack("I", elfhdr[48:52])
+
+            # Find the symbol table and string table
+            symtab_offset = 0
+            symtab_size = 0
+            strtab_offset = 0
+            strtab_size = 0
+            f.seek(elf_shoff)
+            for i in range(elf_shnum):
+                shdr = f.read(64)
+                sh_type = struct.unpack("I", shdr[4:8])[0]
+                if sh_type == 2:
+                    symtab_offset = struct.unpack("Q", shdr[24:32])[0]
+                    symtab_size = struct.unpack("Q", shdr[32:40])[0]
+                elif sh_type == 3 and i != elf_shstrndx:
+                    strtab_offset = struct.unpack("Q", shdr[24:32])[0]
+                    strtab_size = struct.unpack("Q", shdr[32:40])[0]
+
+            # Read the symbol table
+            f.seek(symtab_offset)
+            symtab = f.read(symtab_size)
+
+            # Read the string table
+            f.seek(strtab_offset)
+            strtab = f.read(strtab_size)
+
+        for i in range(symtab_size // 24):
+            sym_data = symtab[i*24 : (i+1)*24]
+            sym = struct.unpack("IBBHQQ", sym_data)
+            if sym[1] & 0xf != 1: # STT_OBJECT
+                continue
+
+            name = strtab[sym[0]:]
+            name = name[:name.find(b'\0')].decode('ascii')
+            self.symbols[name] = sym[4] + self.base_addr
+
+    def __call__(self, name):
+        try:
+            return self.symbols[name]
+        except Exception as e:
+            raise Exception("failed to get address of symbol '%s': " % name)
+
+
+class ProcMem(object):
+    def __init__(self, pid):
+        mem_path = os.path.join('/proc', str(pid), 'mem')
+        self.mem_fp = open(mem_path, 'rb')
+
+    def read(self, addr, size):
+        try:
+            self.mem_fp.seek(addr)
+            data = self.mem_fp.read(size)
+            return data
+        except Exception:
+            raise Exception("read memory 0x%x-0x%x failed" %
+                            (addr, addr + size))
 
 
 class Dumper(object):
@@ -1337,7 +1437,7 @@ class Dumper(object):
 
     offset = value.type.member_name.offset if insintance(value, Struct.Value) else None
     assert offset == (value.type.get('member_name').offset if insintance(value, Struct.Value) else None)
-        Get offset of the member.
+        Get the offset of the member.
 
     values = [ v for v in dumper.list(first_node_value_or_str, container_type_or_str, list_member_str)]
         Iterate a list or hlist.
@@ -1348,7 +1448,7 @@ class Dumper(object):
     def __init__(self, fmt=None, mem_reader=None, sym_searcher=None,
                  btf_path=DEFAULT_BTF_PATH, cache_dir=DEFAULT_CACHE_DIR):
         self.sym_searcher = sym_searcher or KernelSym()
-        self.mem_reader = mem_reader or KernelMem()
+        self.mem_reader = mem_reader or CoreMem()
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
@@ -1586,6 +1686,8 @@ if __name__ == '__main__':
                         help='show debug information')
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='suppress log')
+    parser.add_argument('-p', '--pid', type=int,
+                        help='target process ID, or kernel if not specified')
     parser.add_argument('-x', '--hex-string', action='store_true',
                         help='dump byte array in hex instead of string')
     parser.add_argument('-a', '--array-max', type=int, default=0,
@@ -1596,8 +1698,7 @@ if __name__ == '__main__':
                         help='check the expression value every WATCH_INTERVAL '
                              'seconds and dump it when it changes')
     parser.add_argument('-t', '--btf-paths', type=str,
-                        help='BTF paths, separated by ","',
-                        default=DEFAULT_BTF_PATH)
+                        help='BTF paths, separated by ","')
     parser.add_argument('-c', '--cache-dir', type=str,
                         help='directory to save cache, set empty to disable cache',
                         default=DEFAULT_CACHE_DIR)
@@ -1614,14 +1715,26 @@ if __name__ == '__main__':
                     string_max_force=string_max_force)
 
     try:
+        if args.pid:
+            sym_searcher = ElfSym(args.pid)
+            mem_reader = ProcMem(args.pid)
+            if not args.btf_paths:
+                raise Exception("BTF path must be specified")
+        else:
+            sym_searcher = KernelSym()
+            mem_reader = CoreMem()
+            args.btf_paths = args.btf_paths or DEFAULT_BTF_PATH
+
         dumper = Dumper(btf_path=args.btf_paths.split(','),
-                        fmt=fmt, cache_dir=args.cache_dir)
-        if not args.expression:
-            if not sys.flags.interactive:
-                parser.print_help()
-                raise Exception("expression should be specified")
-            else:
-                print("type 'print(dumper.HELP)' to see help message")
+                        fmt=fmt, cache_dir=args.cache_dir,
+                        sym_searcher=sym_searcher, mem_reader=mem_reader)
+
+        if sys.flags.interactive:
+            print("type 'print(dumper.HELP)' to see help message")
+
+        if not args.expression and not sys.flags.interactive:
+            parser.print_help()
+            raise Exception("expression must be specified")
         elif len(args.expression) == 1 and args.expression[0] in ('netdev', 'net'):
             dumper.show_netdev()
         else:
