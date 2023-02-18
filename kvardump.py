@@ -1430,7 +1430,7 @@ class Dumper(object):
     value = dumper.eval(expression)
         Evaluate the expression, and return the value.
 
-        expression: rvalue expression in C style. '.', '->', '[]', '()' and typecast are supported.
+        expression: expression in C style. '.', '->', '[]', '()' and typecast are supported.
                     e.g.: '((struct net)init_net).ipv4.fib_main->tb_data'
         value: a variable instance, could be a number, array, pointer, struct, or their complexes.
 
@@ -1736,7 +1736,7 @@ if __name__ == '__main__':
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog)
     parser.add_argument('expression', type=str, nargs='*',
-                        help='rvalue expression in C style with typecast, '
+                        help='expression in C style with typecast, '
                         'or "netdev" to list net devices')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='show debug information')
