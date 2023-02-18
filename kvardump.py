@@ -60,6 +60,7 @@ def error(txt):
 def log_exception():
     if not verbose:
         return
+
     exc_type, exc_value, exc_traceback = sys.exc_info()
     error(err_txt(exc_value))
     traceback.print_exception(exc_type, exc_value, exc_traceback,
@@ -156,8 +157,7 @@ class BTF(object):
                     self.load_cache(cache_path)
                     return
             except Exception as e:
-                print("load cache from %s failed: %s" % (cache_path, e),
-                        file=sys.stderr)
+                error("load cache from %s failed: %s" % (cache_path, e))
                 log_exception()
 
         self.parse()
@@ -166,8 +166,7 @@ class BTF(object):
             try:
                 self.save_cache(cache_path)
             except Exception as e:
-                print("save cache to %s failed: %s" % (cache_path, e),
-                        file=sys.stderr)
+                error("save cache to %s failed: %s" % (cache_path, e))
                 log_exception()
 
     def __getitem__(self, kind_name):
@@ -185,7 +184,7 @@ class BTF(object):
         return _decorator
 
     def load_cache(self, path):
-        print("loading cache from '%s'" % path, file=sys.stderr)
+        info("loading cache from '%s'" % path)
 
         with open(path, 'r') as f:
             cache = json.load(f)
@@ -196,7 +195,7 @@ class BTF(object):
             self.id2type = {}
 
     def save_cache(self, path):
-        print("writing cache to '%s'" % path, file=sys.stderr)
+        info("writing cache to '%s'" % path)
 
         dir = os.path.dirname(path)
         if not os.path.exists(dir):
@@ -262,7 +261,7 @@ class BTF(object):
         return type
 
     def parse(self):
-        print("parsing types in '%s'" % self.btf_path, file=sys.stderr)
+        info("parsing types in '%s'" % self.btf_path)
         self.name2id = {}
         # type ID start from 1
         self.offsets = [None]
@@ -1330,6 +1329,7 @@ class ElfSym(object):
     def read_symbols(self, path):
         self.symbols = {}
 
+        info("reading symbols in '%s'" % path)
         # Open the ELF file
         with open(path, "rb") as f:
             # Read the ELF file header
@@ -1346,6 +1346,7 @@ class ElfSym(object):
             strtab_offset = 0
             strtab_size = 0
             f.seek(elf_shoff)
+
             for i in range(elf_shnum):
                 shdr = f.read(64)
                 sh_type = struct.unpack("I", shdr[4:8])[0]
@@ -1608,17 +1609,26 @@ class Dumper(object):
         value = self.eval(expr)
         return "%s = %s;" % (expr, str(value))
 
-    def list(self, first_ptr, type, member):
-        if isinstance(first_ptr, str):
-            first_ptr = self.eval(first_ptr)
+    def container_of(self, value, type, member):
+        if isinstance(value, str):
+            value = self.eval(value)
 
         if isinstance(type, str):
             type = self.get_type(type)
 
+        if value.addr is None:
+            raise Exception("unknown address of %s" % repr(value))
+
+        addr = value.addr - type.get(member).offset
+        return type(addr=addr)
+
+    def list(self, first_ptr, type, member):
+        if isinstance(first_ptr, str):
+            first_ptr = self.eval(first_ptr)
+
         pos = first_ptr
         while int(pos) and int(pos) != first_ptr.addr:
-            addr = int(pos) - type.get(member).offset
-            value = type(addr=addr)
+            value = self.container_of(pos.value, type, member)
             pos = pos.next
             yield value
 
@@ -1763,7 +1773,7 @@ if __name__ == '__main__':
         else:
             do_dump(dumper, args.expression, args.watch_interval)
     except Exception as e:
-        print("Error: %s" % err_txt(e), file=sys.stderr)
+        error("%s" % err_txt(e))
         if verbose:
             reraise(*sys.exc_info())
         exit(1)
