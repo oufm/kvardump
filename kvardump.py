@@ -80,20 +80,20 @@ def log_call(func):
             log_nest_level -= 1
             if verbose:
                 args = args[1:]
-                arg_str1 = ', '.join([str(i) for i in args])
-                arg_str2 = ', '.join([str(k) + '=' + str(v)
+                arg_str1 = ', '.join([repr(i) for i in args])
+                arg_str2 = ', '.join([repr(k) + '=' + repr(v)
                                       for k, v in kwargs.items()])
                 if arg_str1 and arg_str2:
                     arg_str = arg_str1 + ', ' + arg_str2
                 else:
                     arg_str = arg_str1 + arg_str2
-                if isinstance(ret, tuple):
-                    ret_str = ', '.join([str(i) for i in ret])
-                    ret_str = '(%s)' % ret_str
-                else:
-                    ret_str = str(ret)
-                print("call[%d]: %s(%s) = '%s'" %
-                      (log_nest_level, func.__name__, arg_str, ret_str),
+                # if isinstance(ret, tuple):
+                #     ret_str = ', '.join([str(i) for i in ret])
+                #     ret_str = '(%s)' % ret_str
+                # else:
+                #     ret_str = str(ret)
+                print("call[%d]: %s(%s) = %s" %
+                      (log_nest_level, func.__name__, arg_str, repr(ret)),
                       file=sys.stderr)
         return ret
     return _func
@@ -328,6 +328,22 @@ class BaseValue(object):
     def __str__(self):
         return self.to_str()
 
+    def __repr__(self):
+        if self.addr is None:
+            addr_str = 'None'
+        else:
+            addr_str = "0x%x" % self.addr
+
+        if self._data is None:
+            data_str = 'None'
+        else:
+            data_str = codecs.encode(self._data[:8], 'hex').decode()
+            if len(self._data) > 8:
+                data_str += '...'
+        return "%s(type='%s', addr=%s, data=%s)" % (
+            self.type.__class__.__name__,
+            str(self.type), addr_str, data_str)
+
     @property
     def data(self):
         if self._data:
@@ -374,6 +390,9 @@ class BTFType(object):
             return repr(self)
         return self.name
 
+    def __repr__(self):
+        return str(self)
+
     def __call__(self, data=None, addr=None):
         if isinstance(data, BaseValue):
             return self.Value(self, addr=data.addr)
@@ -398,11 +417,17 @@ class Void(BTFType):
     def __init__(self, btf, name):
         self.btf = btf
         self.name = name
+        self.size = 0
 
     @classmethod
     def from_btf(cls, btf, name, size, type, vlen, kind_flag, ext_data):
         return cls(btf, name)
 
+    def __str__(self):
+        return self.name or "void"
+
+    class Value(BaseValue):
+        pass
 
 @BTF.register_kind(BTF.KIND_INT)
 class Int(BTFType):
@@ -945,11 +970,13 @@ class DataSec(BTFType):
 
 
 class Token(object):
-    pass
+    def __repr__(self):
+        return str(self)
 
 
 class AST(object):
-    pass
+    def __repr__(self):
+        return str(self)
 
 
 class Symbol(Token, AST):
@@ -1623,15 +1650,115 @@ class Dumper(object):
 
         raise Exception("unsupported expression: %s" % expr)
 
+    @log_call
+    def _eval(self, expr):
+        if isinstance(expr, Typecast):
+            return self._eval(expr.variable).cast(self.get_type(expr))
+            # addr, _ = self.get_addr_type(expr.variable)
+            # return addr, self.get_type(expr)
+
+        elif isinstance(expr, Access):
+            val = self._eval(expr.variable)
+            # addr, type = self.get_addr_type(expr.variable)
+            # if type is None:
+            #     raise Exception("type of '%s' is unknown" % expr.variable)
+
+            if not val.type.is_kind(BTF.KIND_STRUCT) and \
+                not val.type.is_kind(BTF.KIND_UNION):
+                raise Exception("type of '%s' is '%s', neither struct nor union, "
+                                "'.' is not allowed" % (expr.variable, val.type))
+
+            return val.get(expr.member)
+            # member = type.get(expr.member)
+            # return addr + (member.offset), member.ref
+
+        elif isinstance(expr, Dereference):
+            val = self._eval(expr.variable)
+            # addr, type = self.get_addr_type(expr.variable)
+            # if type is None:
+            #     raise Exception("type of '%s' is unknown" % expr.variable)
+            # if val.type.is_kind(BTF.KIND_ARRAY):
+            #     raise Exception("type of '%s' is '%s', which is an array, "
+            #                     "not a pointer, '%s' is not allowed" %
+            #                     (expr.variable, val.type,
+            #                      '->' if expr.member else '*'))
+            # if val.type.is_kind(BTF.KIND_STRUCT) or val.type.is_kind(BTF.KIND_UNION):
+            #     if expr.member:
+            #         raise Exception("type of '%s' is '%s', '.' "
+            #                         "should be used instead of '->'" %
+            #                         (expr.variable, val.type))
+            if not val.type.is_kind(BTF.KIND_PTR):
+                raise Exception("type of '%s' is '%s', not a pointer, "
+                                "'%s' is not allowed" %
+                                (expr.variable, val.type,
+                                '->' if expr.member else '*'))
+            val = val.value
+            # type = type.ref
+            # addr = self.dereference_addr(addr)
+            # offset = 0
+            if expr.member:
+                if not val.type.is_kind(BTF.KIND_STRUCT) and \
+                    not val.type.is_kind(BTF.KIND_UNION):
+                    raise Exception("type of '*(%s)' is '%s', neither struct nor union, "
+                                    "'->' is not allowed" %
+                                    (expr.variable, val.type))
+                val = val.get(expr.member)
+                # type = type.get(expr.member)
+                # offset = type.offset
+                # type = type.ref
+            return val
+            # return addr + offset, type
+
+        elif isinstance(expr, Index):
+            val = self._eval(expr.variable)
+            # addr, type = self.get_addr_type(expr.variable)
+            # if type is None:
+            #     raise Exception("type of '%s' is not specified" %
+            #                     expr.variable)
+            if not val.type.is_kind(BTF.KIND_ARRAY) and \
+                not val.type.is_kind(BTF.KIND_PTR):
+                raise Exception("type of '%s' is '%s', neither pointer "
+                                "nor array, index is not allowed" %
+                                (expr.variable, val.type))
+
+            if val.type.is_kind(BTF.KIND_PTR):
+                # index a pointer instead of array
+                val = val.value
+                # addr = self.dereference_addr(addr)
+
+            return val[expr.index]
+            # type = type.ref
+            # return addr + type.size * expr.index, type
+
+        elif isinstance(expr, Symbol):
+            addr = self.sym_searcher(expr.value)
+            type = Void(self.btfs[0], 'unknown')
+            return type(addr=addr)
+            # return self.sym_searcher(expr.value), None
+
+        elif isinstance(expr, Number):
+            if expr.value < 0:
+                type = Int(self.btfs[0], 'long', 8, signed=True)
+                return type(data=struct.pack('q', expr.value))
+            else:
+                type = Int(self.btfs[0], 'unsigned long', 8, signed=False)
+                return type(data=struct.pack('Q', expr.value))
+            # return expr.value, None
+
+        raise Exception("unsupported expression: %s" % expr)
+
     def eval(self, expr):
         if isinstance(expr, str):
             expr = Parser(Lexer(expr)).parse()
 
-        addr, type = self.get_addr_type(expr)
-        if type is None:
-            raise Exception("type of '%s' is not specified" % expr)
+        val = self._eval(expr)
+        if val.type.is_kind(BTF.KIND_VOID):
+        # addr, type = self.get_addr_type(expr)
+        # if type is None:
+            raise Exception("type of '%s' is not unknown" % expr)
 
-        return type(addr=addr)
+        return val
+        # return type(addr=addr)
 
     def dump(self, expr):
         value = self.eval(expr)
@@ -1736,8 +1863,7 @@ if __name__ == '__main__':
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog)
     parser.add_argument('expression', type=str, nargs='*',
-                        help='expression in C style with typecast, '
-                        'or "netdev" to list net devices')
+                        help='expression in C style with typecast')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='show debug information')
     parser.add_argument('-q', '--quiet', action='store_true',
