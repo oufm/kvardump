@@ -713,7 +713,7 @@ class StructUnion(BTFType):
             self.name = name
             self.type = type
             self.offset_bits = offset
-            self.offset = offset / 8
+            self.offset = offset // 8
             self.size = size
 
         def __call__(self, *args, **kwargs):
