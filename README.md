@@ -53,3 +53,46 @@ The specific usage can be seen in `./kvardump -h`.
 You can also use `python -i kvardump.py` to enter the interactive python to call the utility functions provided by kvardump.
 
 Type `print(dumper.HELP)` in the interactive python to see help information.
+
+## Example
+
+```
+root@ubuntu:~# ./kvardump.py net
+loading cache from '/tmp/kvardump/vmlinux.btfcache'
+"lo" @ 0xffff9ff1c25f1000
+"ens33" @ 0xffff9ff1eeee8000
+
+root@ubuntu:~# ./kvardump.py '((struct net_device *)0xffff9ff1eeee8000)->stats'
+loading cache from '/tmp/kvardump/vmlinux.btfcache'
+(((struct net_device *)0xffff9ff1eeee8000))->stats = {
+    .rx_packets = 16318,
+    .tx_packets = 7387,
+    .rx_bytes = 17165089,
+    .tx_bytes = 727951,
+    .rx_errors = 0,
+    .tx_errors = 0,
+    .rx_dropped = 0,
+    .tx_dropped = 0,
+    .multicast = 0,
+    .collisions = 0,
+    .rx_length_errors = 0,
+    .rx_over_errors = 0,
+    .rx_crc_errors = 0,
+    .rx_frame_errors = 0,
+    .rx_fifo_errors = 0,
+    .rx_missed_errors = 0,
+    .tx_aborted_errors = 0,
+    .tx_carrier_errors = 0,
+    .tx_fifo_errors = 0,
+    .tx_heartbeat_errors = 0,
+    .tx_window_errors = 0,
+    .rx_compressed = 0,
+    .tx_compressed = 0,
+};
+
+root@ubuntu:~# python -i kvardump.py 
+loading cache from '/tmp/kvardump/vmlinux.btfcache'
+type 'print(dumper.HELP)' to see help message
+>>> [ str(dev.name) for dev in dumper.list('((struct net) init_net).dev_base_head.next', 'struct net_device', 'dev_list') ]
+['"lo"', '"ens33"']
+```
