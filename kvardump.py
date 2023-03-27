@@ -1504,10 +1504,10 @@ class Dumper(object):
     assert offset == (value.type.get('member_name').offset if insintance(value, Struct.Value) else None)
         Get the offset of the member.
 
-    values = [ v for v in dumper.list(first_ptr_or_str, container_type_or_str, list_member_str)]
+    values = [ v for v in dumper.list(first_ptr_or_str, container_type_or_str, list_member_str) ]
         Iterate a list or hlist.
         e.g.:
-            print(dev.name) for dev in dumper.list('((struct net) init_net).dev_base_head.next', 'struct net_device', 'dev_list')
+            [ str(dev.name) for dev in dumper.list('((struct net) init_net).dev_base_head.next', 'struct net_device', 'dev_list') ]
     """
 
     def __init__(self, fmt=None, mem_reader=None, sym_searcher=None,
@@ -1582,7 +1582,8 @@ class Dumper(object):
             if expr.member:
                 if not val.type.is_kind(BTF.KIND_STRUCT) and \
                     not val.type.is_kind(BTF.KIND_UNION):
-                    raise Exception("type of '*(%s)' is '%s', neither struct nor union, "
+                    raise Exception("type of '*(%s)' is '%s', "
+                                    "neither struct nor union, "
                                     "'->' is not allowed" %
                                     (expr.variable, val.type))
                 val = val.get(expr.member)
@@ -1596,7 +1597,8 @@ class Dumper(object):
                                 "nor array, index is not allowed" %
                                 (expr.variable, val.type))
             if val.type.is_kind(BTF.KIND_PTR):
-                val = val.value
+                val = val.value.cast(
+                    Array(val.btf, '', val.type.ref, expr.index + 1))
             return val[expr.index]
 
         elif isinstance(expr, Symbol):
