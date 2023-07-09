@@ -132,15 +132,16 @@ class BTF(object):
     def __init__(self,
                  btf_path=DEFAULT_BTF_PATH,
                  cache_dir=DEFAULT_CACHE_DIR,
-                 mem_reader=None, to_btf_type=None,
-                 fmt=FormatOpt()):
+                 mem_reader=None,
+                 fmt=FormatOpt(),
+                 value_init_hook=None):
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
         self.btf_path = btf_path
         self.mem_reader = mem_reader
-        self.to_btf_type = to_btf_type
+        self.value_init_hook = value_init_hook
         self.fmt = fmt
 
         self.id2type = {}
@@ -322,6 +323,9 @@ class BaseValue(object):
         self._data = data
         self.addr = addr
 
+        if self.btf.value_init_hook:
+            self.btf.value_init_hook(self)
+
     def __str__(self):
         return self.to_str()
 
@@ -367,10 +371,7 @@ class BaseValue(object):
     def to_int(self):
         return int(self)
 
-    def cast(self, type):
-        if not isinstance(type, BTFType) and self.btf.to_btf_type:
-            type = self.btf.to_btf_type(type)
-
+    def _cast(self, type):
         if self.addr:
             return type(addr=self.addr)
         elif type.size <= len(self.data):
@@ -1464,7 +1465,7 @@ class Dumper(object):
                     e.g.: '((struct net)init_net).ipv4.fib_main->tb_data'
         value: a variable instance, could be a number, array, pointer, struct, or their complexes.
 
-    print(str(value))
+    print(value)
         Pretty print the value.
 
     addr = value.addr
@@ -1520,8 +1521,16 @@ class Dumper(object):
 
     def __init__(self, fmt=None, mem_reader=None, sym_searcher=None,
                  btf_path=DEFAULT_BTF_PATH, cache_dir=DEFAULT_CACHE_DIR):
-        def to_btf_type(type):
-            return self.get_type(type)
+        def value_init_handle(value):
+            def cast(type):
+                if isinstance(type, str):
+                    type = self.get_type(type)
+                return value._cast(type)
+            value.cast = cast
+
+            def container_of(type, member):
+                return self.container_of(value, type, member)
+            value.container_of = container_of
 
         self.sym_searcher = sym_searcher or KernelSym()
         mem_reader = mem_reader or CoreMem()
@@ -1534,7 +1543,7 @@ class Dumper(object):
                          mem_reader=mem_reader,
                          fmt=(fmt or FormatOpt()),
                          cache_dir=cache_dir,
-                         to_btf_type=to_btf_type
+                         value_init_hook=value_init_handle
                         ) for path in path_list]
 
     @log_call
@@ -1574,7 +1583,7 @@ class Dumper(object):
     @log_call
     def _eval(self, expr):
         if isinstance(expr, Typecast):
-            return self._eval(expr.variable).cast(self.get_type(expr))
+            return self._eval(expr.variable)._cast(self.get_type(expr))
 
         elif isinstance(expr, Access):
             val = self._eval(expr.variable)
@@ -1610,7 +1619,7 @@ class Dumper(object):
                                 "nor array, index is not allowed" %
                                 (expr.variable, val.type))
             if val.type.is_kind(BTF.KIND_PTR):
-                val = val.value.cast(
+                val = val.value._cast(
                     Array(val.btf, '', val.type.ref, expr.index + 1))
             return val[expr.index]
 
