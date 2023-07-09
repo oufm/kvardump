@@ -132,13 +132,15 @@ class BTF(object):
     def __init__(self,
                  btf_path=DEFAULT_BTF_PATH,
                  cache_dir=DEFAULT_CACHE_DIR,
-                 mem_reader=None, fmt=FormatOpt()):
+                 mem_reader=None, to_btf_type=None,
+                 fmt=FormatOpt()):
         self.arch_size = 8
         if platform.architecture()[0] == '32bit':
             self.arch_size = 4
 
         self.btf_path = btf_path
         self.mem_reader = mem_reader
+        self.to_btf_type = to_btf_type
         self.fmt = fmt
 
         self.id2type = {}
@@ -363,6 +365,9 @@ class BaseValue(object):
         raise NotImplementedError()
 
     def cast(self, type):
+        if not isinstance(type, BTFType) and self.btf.to_btf_type:
+            type = self.btf.to_btf_type(type)
+
         if self.addr:
             return type(addr=self.addr)
         elif type.size <= len(self.data):
@@ -1512,6 +1517,9 @@ class Dumper(object):
 
     def __init__(self, fmt=None, mem_reader=None, sym_searcher=None,
                  btf_path=DEFAULT_BTF_PATH, cache_dir=DEFAULT_CACHE_DIR):
+        def to_btf_type(type):
+            return self.get_type(type)
+
         self.sym_searcher = sym_searcher or KernelSym()
         mem_reader = mem_reader or CoreMem()
         self.arch_size = 8
@@ -1519,10 +1527,12 @@ class Dumper(object):
             self.arch_size = 4
 
         path_list = btf_path if isinstance(btf_path, list) else [btf_path]
-        self.btfs = [BTF(path, mem_reader=mem_reader,
+        self.btfs = [BTF(btf_path=path,
+                         mem_reader=mem_reader,
                          fmt=(fmt or FormatOpt()),
-                         cache_dir=cache_dir)
-                    for path in path_list]
+                         cache_dir=cache_dir,
+                         to_btf_type=to_btf_type
+                        ) for path in path_list]
 
     @log_call
     def get_type(self, typecast):
