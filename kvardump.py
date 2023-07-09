@@ -364,6 +364,9 @@ class BaseValue(object):
     def to_str(self, indent=0):
         raise NotImplementedError()
 
+    def to_int(self):
+        return int(self)
+
     def cast(self, type):
         if not isinstance(type, BTFType) and self.btf.to_btf_type:
             type = self.btf.to_btf_type(type)
