@@ -1485,6 +1485,10 @@ class Dumper(object):
     value = type(addr=addr)
         Get the value with specified type and address.
 
+    value2 = value.cast(new_type_str)
+    assert value.addr == value2.addr
+        Transform value to another type
+
     number = int(value) if isintance(value, Int.Value) else None
         Get the number from the Int value.
 
