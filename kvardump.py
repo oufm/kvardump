@@ -913,7 +913,7 @@ class FuncProto(BTFType):
         self.type = type
 
     def __str__(self):
-        return "%s (*%s)(...)" % str(self.ref, self.name)
+        return "%s (*%s)(...)" % (str(self.ref), self.name)
 
     @staticmethod
     def btf_ext_size(vlen):
