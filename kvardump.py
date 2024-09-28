@@ -6,6 +6,7 @@ import re
 import sys
 import time
 import json
+import copy
 import codecs
 import hashlib
 import argparse
@@ -391,11 +392,11 @@ class BTFType(object):
 
     def __str__(self):
         if not self.name:
-            return repr(self)
+            return 'NO_NAME'
         return self.name
 
     def __repr__(self):
-        return str(self)
+        return '%s(%s)' % (self.__class__.__name__, str(self))
 
     def __call__(self, data=None, addr=None):
         if isinstance(data, BaseValue):
@@ -668,7 +669,8 @@ class Array(BTFType):
                     if end >= 0:
                         str_val = str_val[:end]
                     if not re.search(r'[^\t-\r\x20-\x7e]', str_val):
-                        return '"%s"' % (str_val + (omit_tip if end < 0 else ''))
+                        return ('"%s"' if indent > 0 else '%s') % (
+                            str_val + (omit_tip if end < 0 else ''))
                 except Exception:
                     pass
 
@@ -725,6 +727,12 @@ class StructUnion(BTFType):
             self.offset = offset // 8
             self.size = size
 
+        def __repr__(self):
+            try:
+                return '%s:%s' % (self.name, repr(self.ref))
+            except Exception:
+                return '%s:%s' % (self.name, repr(self.type))
+
         def __call__(self, *args, **kwargs):
             return NotImplementedError()
 
@@ -755,7 +763,10 @@ class StructUnion(BTFType):
         for m in self.anonymous_members:
             if isinstance(m.ref, StructUnion):
                 try:
-                    return m.ref.get(member)
+                    dup = copy.copy(m.ref.get(member))
+                    dup.offset += m.offset
+                    dup.offset_bits += m.offset_bits
+                    return dup
                 except KeyError:
                     pass
 
@@ -1557,9 +1568,18 @@ class Dumper(object):
             typecast = Parser(Lexer('(%s)a' % typecast)).parse()
 
         for btf in self.btfs:
+            if typecast.new_type == 'void':
+                type = Void(type.btf, '')
+                break
+
             if typecast.keyword == 'struct':
                 try:
                     type = btf[(BTF.KIND_STRUCT, typecast.new_type)]
+                except KeyError:
+                    continue
+            elif typecast.keyword == 'union':
+                try:
+                    type = btf[(BTF.KIND_UNION, typecast.new_type)]
                 except KeyError:
                     continue
             else:
